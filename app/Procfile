@@ -1,0 +1,13 @@
+# Procfile — tells Heroku / Railway / Render how to start the app
+#
+# Uses 1 gevent-websocket worker (required for Flask-SocketIO with gevent)
+# Reads PORT from the platform's environment variable automatically.
+#
+web: gunicorn wsgi:application \
+       --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
+       --workers 1 \
+       --bind 0.0.0.0:$PORT \
+       --timeout 120 \
+       --log-level info \
+       --access-logfile - \
+       --error-logfile -
