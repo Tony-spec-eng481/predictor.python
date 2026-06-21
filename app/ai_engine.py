@@ -33,14 +33,14 @@ class AIConfig:
     stop_loss_pct: float = 30.0           # Stop session if loss exceeds % of bankroll
     take_profit_pct: float = 50.0         # Stop session if profit exceeds % of bankroll
     kelly_fraction: float = 0.25          # Fractional Kelly (0.25 = quarter Kelly)
-    min_data_points: int = 30             # Minimum rounds before AI bets
+    min_data_points: int = 15             # Minimum rounds before AI bets (was 30)
     analysis_window: int = 100            # How many recent rounds to analyse
-    cooldown_after_loss: int = 1           # Rounds to skip after a loss
+    cooldown_after_loss: int = 0           # Rounds to skip after a loss (was 1)
     max_consecutive_losses: int = 5       # Force stop after N consecutive losses
     dry_run: bool = True                  # If True, log decisions but don't execute
     target_win_rate: float = 0.65         # Aim for this win probability
     preferred_targets: List[float] = field(
-        default_factory=lambda: [1.25, 1.30, 1.50, 1.80, 1.95]
+        default_factory=lambda: [1.44, 2.30]
     )
 
     # Dynamic/Tunable weights and thresholds for evaluation
@@ -55,19 +55,19 @@ class AIConfig:
     w_streak_high: float = 8.0
     w_prob_low: float = 15.0
     w_loss_penalty: float = 5.0
-    confidence_threshold: float = 55.0  # Dynamic threshold
+    confidence_threshold: float = 35.0  # Dynamic threshold (conservative: 35.0)
     weight_ev: float = 0.4              # EV weight in target selection
     weight_prob: float = 0.6            # Probability weight in target selection
 
     def __post_init__(self):
         # Set default weights and thresholds based on risk level if they are unchanged from baseline defaults
-        if self.confidence_threshold == 55.0 and self.weight_ev == 0.4 and self.weight_prob == 0.6:
+        if self.confidence_threshold == 35.0 and self.weight_ev == 0.4 and self.weight_prob == 0.6:
             if self.risk_level == "moderate":
-                self.confidence_threshold = 45.0
+                self.confidence_threshold = 20.0
                 self.weight_ev = 0.6
                 self.weight_prob = 0.4
             elif self.risk_level == "aggressive":
-                self.confidence_threshold = 35.0
+                self.confidence_threshold = 0.0
                 self.weight_ev = 0.8
                 self.weight_prob = 0.2
 
@@ -240,13 +240,14 @@ class AIStrategyEngine:
         if limit_decision:
             return limit_decision
 
-        # Guard: cooldown after loss
-        if self.stats.consecutive_losses > 0 and self.stats.rounds_since_last_bet < self.config.cooldown_after_loss:
-            self.stats.rounds_since_last_bet += 1
-            return self._skip(
-                f"Cooldown after loss ({self.stats.rounds_since_last_bet}/{self.config.cooldown_after_loss})",
-                {},
-            )
+        # Guard: cooldown after loss (disabled per user request for no skips)
+        # if self.stats.consecutive_losses > 0 and self.stats.rounds_since_last_bet < self.config.cooldown_after_loss:
+        #     self.stats.rounds_since_last_bet += 1
+        #     return self._skip(
+        #         f"Cooldown after loss ({self.stats.rounds_since_last_bet}/{self.config.cooldown_after_loss})",
+        #         {},
+        #     )
+        pass
 
         # ---- Full analysis ----
         analysis = self._analyse(multipliers)
@@ -272,8 +273,8 @@ class AIStrategyEngine:
             return
 
         self.stats.total_bets += 1
-        won = actual_multiplier >= decision.target_multiplier
-        payout = decision.stake * decision.target_multiplier if won else 0
+        won = actual_multiplier > 0.0
+        payout = decision.stake * actual_multiplier if won else 0
         profit = payout - decision.stake
 
         self.stats.current_balance += profit
@@ -362,7 +363,7 @@ class AIStrategyEngine:
 
         # Probability of reaching specific multipliers
         prob_targets = {}
-        for t in [1.20, 1.25, 1.30, 1.50, 1.80, 1.95, 2.00, 3.00, 5.00]:
+        for t in [1.10, 1.20, 1.25, 1.30, 1.44, 1.50, 1.80, 1.95, 2.00, 2.30, 3.00, 5.00]:
             hits = sum(1 for m in window if m >= t)
             prob_targets[f"{t}x"] = round(hits / n, 4)
 
@@ -479,73 +480,138 @@ class AIStrategyEngine:
 
     def _select_target(self, analysis: dict) -> tuple:
         """
-        Pick the optimal cashout target based on probability analysis
-        and the configured risk level, dynamically adjusting it based on performance.
+        Pick the optimal cashout target (strictly 1.44 or 2.30) based on analysis.
         """
         probs = analysis["probabilities"]
-        mr = analysis["mean_reversion"]
-        vol = analysis.get("volatility_10", 0)
-        stdev = analysis.get("stdev", 1.0)
-
-        best_target = 1.50
-        best_ev = -999.0
-
-        for target in self.config.preferred_targets:
-            # Cap preferred targets at 1.95 max
-            target = min(target, 1.95)
-            key = f"{target}x"
-            prob = probs.get(key, 0)
-            ev = prob * (target - 1) - (1 - prob)
-            score = ev * self.config.weight_ev + prob * self.config.weight_prob
-
-            if score > best_ev:
-                best_ev = score
-                best_target = target
-
-        # Dynamic Adjustment: AI decides target scaling based on streak and volatility
-        # 1. Win streak scaling: Increase target on positive momentum
-        if self.stats.current_streak > 0:
-            # Scale target up by +0.05 per win, up to a maximum of 1.95x
-            best_target = min(1.95, best_target + (self.stats.current_streak * 0.05))
+        prob_23 = probs.get("2.30x", probs.get("2.3x", 0.35))
+        
+        # Decide between 1.44 and 2.30 based on risk_level & probability threshold
+        threshold_prob = 0.38
+        if self.config.risk_level == "conservative":
+            threshold_prob = 0.45
+        elif self.config.risk_level == "aggressive":
+            threshold_prob = 0.30
             
-        # 2. Loss streak scaling: Decrease target to increase safety
-        elif self.stats.consecutive_losses > 0:
-            # Scale target down by -0.05 per consecutive loss, down to a minimum of 1.20x
-            best_target = max(1.20, best_target - (self.stats.consecutive_losses * 0.05))
-
-        # 3. Mean reversion scaling
-        if mr["signal"] == "oversold" and mr["strength"] > 40:
-            best_target = min(1.95, best_target + 0.1)
-        elif mr["signal"] == "overbought" and mr["strength"] > 40:
-            best_target = max(1.20, best_target - 0.1)
-
-        # 4. Volatility scaling
-        if vol > stdev * 1.3:
-            # Lower target under high volatility
-            best_target = max(1.20, best_target - 0.1)
-        elif vol < stdev * 0.7:
-            # Raise target under low volatility
-            best_target = min(1.95, best_target + 0.05)
-
-        # Final rounding and clamping (Max 1.95x target absolute cap)
-        best_target = round(best_target, 2)
-        best_target = max(1.20, min(1.95, best_target))
-
-        # Retrieve target probability
-        prob_key = f"{best_target}x"
-        if prob_key in probs:
-            target_prob = probs[prob_key]
+        if prob_23 >= threshold_prob:
+            best_target = 2.30
         else:
-            # Interpolation/fallback if target is rounded/adjusted
-            keys = [float(k.replace('x', '')) for k in probs.keys() if 'x' in k]
-            keys.sort()
-            if not keys:
-                target_prob = 0.5
-            else:
-                closest_key = min(keys, key=lambda x: abs(x - best_target))
-                target_prob = probs.get(f"{closest_key}x", 0.5)
-
+            best_target = 1.44
+            
+        target_prob = probs.get(f"{best_target}x", 0.5)
         return best_target, target_prob
+
+    def make_step_decision(self, current_multiplier: float, multipliers: List[float]) -> dict:
+        """
+        Evaluate at a specific step in a live round whether to 'move' (GO) or 'cashout'.
+        Only allows cashing out at 1.44 or 2.30.
+        """
+        analysis = self._analyse(multipliers)
+        probs = analysis["probabilities"]
+        
+        # If current multiplier is below 1.44, we must move to reach our first target (1.44)
+        if current_multiplier < 1.44:
+            reason = f"Current multiplier is {current_multiplier}x. Moving forward to reach the first target of 1.44x."
+            return {
+                "action": "move",
+                "reasoning": reason,
+                "confidence": 90.0,
+                "risk_level": "low"
+            }
+            
+        # If current multiplier is exactly 1.44 (or very close)
+        if abs(current_multiplier - 1.44) < 0.02:
+            # Let's reason whether to cash out at 1.44 or move to 2.30!
+            prob_23 = probs.get("2.30x", probs.get("2.3x", 0.35))
+            mr = analysis["mean_reversion"]
+            vol = analysis.get("volatility_10", 0)
+            stdev = analysis.get("stdev", 1.0)
+            
+            reasons = []
+            score = 50.0  # base score for cashing out vs moving. >50 means move (GO), <=50 means cashout
+            
+            # 1. Volatility check
+            if vol > stdev * 1.3:
+                score -= 15.0
+                reasons.append("High volatility makes the next step risky")
+            elif vol < stdev * 0.8:
+                score += 10.0
+                reasons.append("Low volatility indicates stable conditions")
+                
+            # 2. Mean reversion signal
+            if mr["signal"] == "overbought":
+                score -= 10.0 * (mr["strength"] / 50.0)
+                reasons.append(f"Market is overbought (strength {mr['strength']:.0f}%), correction likely")
+            elif mr["signal"] == "oversold":
+                score += 15.0 * (mr["strength"] / 50.0)
+                reasons.append(f"Market is oversold (strength {mr['strength']:.0f}%), expecting recovery")
+                
+            # 3. Streaks
+            streaks = analysis["streaks"]
+            if streaks["current_type"] == "low" and streaks["current_length"] >= 3:
+                score += 10.0
+                reasons.append("Coming off a low streak, recovery expected")
+            elif streaks["current_type"] == "high" and streaks["current_length"] >= 4:
+                score -= 12.0
+                reasons.append("Extended high streak increases risk of crash")
+                
+            # 4. Probability of 2.3x
+            if prob_23 > 0.45:
+                score += 15.0
+                reasons.append(f"High historical probability for 2.3x ({prob_23*100:.0f}%)")
+            elif prob_23 < 0.30:
+                score -= 15.0
+                reasons.append(f"Low historical probability for 2.3x ({prob_23*100:.0f}%)")
+                
+            # 5. Consecutive losses penalty
+            if self.stats.consecutive_losses >= 2:
+                score -= 10.0 * self.stats.consecutive_losses
+                reasons.append(f"Consecutive losses ({self.stats.consecutive_losses}) suggest securing profits")
+
+            if score > 50.0:
+                action = "move"
+                reason_str = "Decided to move towards 2.3x: " + "; ".join(reasons)
+                confidence = min(95.0, score)
+                risk_level = "medium"
+            else:
+                action = "cashout"
+                reason_str = "Decided to cashout at 1.44x: " + "; ".join(reasons)
+                confidence = min(95.0, 100.0 - score)
+                risk_level = "low"
+                
+            return {
+                "action": action,
+                "reasoning": reason_str,
+                "confidence": round(confidence, 1),
+                "risk_level": risk_level
+            }
+            
+        # If current multiplier is between 1.44 and 2.3 (e.g. 1.67, 1.95)
+        if 1.44 < current_multiplier < 2.30:
+            reason = f"Current multiplier is {current_multiplier}x. Moving forward to reach the target of 2.30x."
+            return {
+                "action": "move",
+                "reasoning": reason,
+                "confidence": 85.0,
+                "risk_level": "medium"
+            }
+            
+        # If current multiplier is >= 2.30
+        if current_multiplier >= 2.30:
+            reason = f"Current multiplier is {current_multiplier}x. Reached the target of 2.30x. Decided to cashout."
+            return {
+                "action": "cashout",
+                "reasoning": reason,
+                "confidence": 100.0,
+                "risk_level": "low"
+            }
+            
+        # Default fallback
+        return {
+            "action": "cashout",
+            "reasoning": f"Defaulting to cashout at {current_multiplier}x.",
+            "confidence": 50.0,
+            "risk_level": "medium"
+        }
 
     # ------------------------------------------------------------------
     # Stake calculation (Kelly Criterion)
@@ -658,12 +724,9 @@ class AIStrategyEngine:
         if stake <= 0 or self.stats.current_balance < 10:
             return self._skip("Insufficient balance for minimum bet", analysis)
 
+        # No skips allowed per user request. We will bet anyway.
         if confidence < threshold:
-            return self._skip(
-                f"Confidence too low ({confidence:.0f}% < {threshold}% threshold). " +
-                "; ".join(reasons[-2:]) if reasons else "Waiting for better conditions",
-                analysis,
-            )
+            reasons.append(f"Confidence below threshold ({confidence:.0f}% < {threshold}%), but betting is forced")
 
         return AIDecision(
             action="bet",
@@ -783,7 +846,20 @@ def backtest_simulation(config: AIConfig, multipliers: List[float], shared_cache
 
         decision = engine.make_decision(history_window)
         if decision.action == "bet":
-            engine.record_outcome(actual_val, decision)
+            # Simulate step-by-step decision for the 1.44x and 2.30x targets
+            if actual_val < 1.44:
+                actual_cashout = 0.0
+            else:
+                # We reached 1.44. Decide whether to cash out or move to 2.30
+                step_dec = engine.make_step_decision(1.44, history_window)
+                if step_dec["action"] == "cashout":
+                    actual_cashout = 1.44
+                else:
+                    if actual_val < 2.30:
+                        actual_cashout = 0.0
+                    else:
+                        actual_cashout = 2.30
+            engine.record_outcome(actual_cashout, decision)
         elif decision.action == "skip":
             engine.record_outcome(actual_val, decision)
 

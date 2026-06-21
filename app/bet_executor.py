@@ -81,6 +81,7 @@ class BetExecutor:
         self.page = page
         self.dry_run = dry_run
         self._on_result: Optional[Callable] = None  # Callback for result
+        self._on_step_decision: Optional[Callable] = None
 
     def set_page(self, page):
         """Inject the Playwright page object (shared with collector)."""
@@ -94,11 +95,19 @@ class BetExecutor:
     def on_result(self, callback: Callable):
         self._on_result = callback
 
+    @property
+    def on_step_decision(self):
+        return self._on_step_decision
+
+    @on_step_decision.setter
+    def on_step_decision(self, callback: Callable):
+        self._on_step_decision = callback
+
     # ------------------------------------------------------------------
     # Core execution flow
     # ------------------------------------------------------------------
 
-    async def execute_bet(self, stake: float, target_multiplier: float) -> dict:
+    async def execute_bet(self, stake: float, target_multiplier: float, step_decider: Optional[Callable[[float], dict]] = None) -> dict:
         """
         Full bet lifecycle: set stake → place bet → monitor → cashout/lose.
         Returns a result dict: { 'won': bool, 'actual_multiplier': float, ... }
@@ -126,7 +135,7 @@ class BetExecutor:
                     f"[DRY RUN] Would bet {stake:.2f} KES targeting {target_multiplier}x"
                 )
                 # In dry-run, we just observe/simulate the round outcome without acting
-                actual = await self._observe_round_outcome(target_multiplier)
+                actual = await self._observe_round_outcome(target_multiplier, step_decider)
                 result["actual_multiplier"] = actual
                 result["won"] = actual >= target_multiplier
                 if result["won"]:
@@ -149,17 +158,17 @@ class BetExecutor:
             await self._click_bet()
 
             # Step 4: Monitor and cashout
-            actual = await self._monitor_and_cashout(target_multiplier, stake)
+            actual = await self._monitor_and_cashout(target_multiplier, stake, step_decider=step_decider)
             result["actual_multiplier"] = actual
-            result["won"] = actual >= target_multiplier
+            result["won"] = actual > 0.0
 
             if result["won"]:
-                result["payout"] = stake * target_multiplier
+                result["payout"] = stake * actual
                 result["profit"] = result["payout"] - stake
                 logger.info(f"✅ BET WON: {actual:.2f}x — profit {result['profit']:.2f} KES")
             else:
                 result["profit"] = -stake
-                logger.info(f"❌ BET LOST: crashed at {actual:.2f}x — lost {stake:.2f} KES")
+                logger.info(f"❌ BET LOST: crashed — lost {stake:.2f} KES")
 
         except Exception as e:
             result["error"] = str(e)
@@ -172,42 +181,47 @@ class BetExecutor:
     # ------------------------------------------------------------------
 
     async def _find_element(self, selector_group: str, timeout: int = 5000):
-        """Try multiple selectors in parallel to avoid sequential timeout bottlenecks."""
+        """
+        Check if any selector in the group is visible.
+        If timeout is 0, checks immediately without waiting.
+        If timeout > 0, polls periodically using short sleeps to avoid choking Playwright.
+        """
         selectors = self.SELECTORS.get(selector_group, [])
-        
-        # 1. Quick check: check if any selector is already visible (very small timeout)
+        if not self.page:
+            return None
+
+        # 1. Immediate check first using locator visibility
         for sel in selectors:
             try:
-                elem = await self.page.wait_for_selector(sel, timeout=10, state="visible")
-                if elem:
-                    logger.debug(f"Found {selector_group} immediately with selector: {sel}")
-                    return elem
+                loc = self.page.locator(sel)
+                count = await loc.count()
+                for i in range(count):
+                    elem = loc.nth(i)
+                    if await elem.is_visible():
+                        logger.debug(f"Found {selector_group} immediately with selector: {sel}")
+                        return elem
             except:
                 pass
 
-        # 2. Parallel wait for any selector to become visible
-        async def wait_single(sel):
-            try:
-                return await self.page.wait_for_selector(sel, timeout=timeout, state="visible")
-            except:
-                return None
+        if timeout <= 0:
+            return None
 
-        if selectors and timeout > 50:
-            tasks = [asyncio.create_task(wait_single(sel)) for sel in selectors]
-            try:
-                for future in asyncio.as_completed(tasks, timeout=timeout/1000.0 + 1.0):
-                    elem = await future
-                    if elem:
-                        # Cancel remaining tasks
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
-                        return elem
-            except Exception as e:
-                logger.debug(f"Error during parallel selector wait: {e}")
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
+        # 2. Poll periodically with simple sleeps
+        start = time.time()
+        poll_interval = 0.1 # 100ms
+        while (time.time() - start) * 1000 < timeout:
+            for sel in selectors:
+                try:
+                    loc = self.page.locator(sel)
+                    count = await loc.count()
+                    for i in range(count):
+                        elem = loc.nth(i)
+                        if await elem.is_visible():
+                            logger.debug(f"Found {selector_group} after poll with selector: {sel}")
+                            return elem
+                except:
+                    pass
+            await asyncio.sleep(poll_interval)
 
         return None
 
@@ -216,7 +230,7 @@ class BetExecutor:
         logger.info("Waiting for bet phase...")
         start = time.time()
         while time.time() - start < max_wait:
-            bet_btn = await self._find_element("bet_button", timeout=2000)
+            bet_btn = await self._find_element("bet_button", timeout=0)
             if bet_btn:
                 is_disabled = await bet_btn.is_disabled()
                 if not is_disabled:
@@ -260,41 +274,62 @@ class BetExecutor:
         await asyncio.sleep(0.5)
         logger.info("Bet placed")
 
-    async def _monitor_and_cashout(self, target: float, stake: float, timeout: int = 120) -> float:
+    async def _monitor_and_cashout(self, target: float, stake: float, timeout: int = 120, step_decider: Optional[Callable[[float], dict]] = None) -> float:
         """
         Watch the live multiplier, click GO to advance, and click CASHOUT when target is reached.
         Returns the actual multiplier at resolution.
         """
         logger.info(f"Monitoring round — will cashout at {target}x (stake: {stake} KES)...")
+        
+        # Step 0: Wait up to 5 seconds for the round to actually start (GO or CASHOUT button appearing)
+        start_wait = time.time()
+        round_started = False
+        while time.time() - start_wait < 5.0:
+            go_btn = await self._find_element("go_button", timeout=0)
+            cashout_btn = await self._find_element("cashout_button", timeout=0)
+            if go_btn or cashout_btn:
+                round_started = True
+                break
+            await asyncio.sleep(0.1)
+
+        if not round_started:
+            logger.warning("Round did not seem to start (neither GO nor CASHOUT button appeared)")
+            return 0.0
+
         start = time.time()
         last_multiplier = 0.0
 
         while time.time() - start < timeout:
             # 1. Check if the round ended (crashing or winning and resetting to PLAY state)
-            play_btn = await self._find_element("bet_button", timeout=500)
+            play_btn = await self._find_element("bet_button", timeout=0)
             if play_btn:
                 is_disabled = await play_btn.is_disabled()
                 if not is_disabled:
                     # PLAY button is visible and active again, meaning the round is over!
                     logger.info("PLAY button is active again. Round ended.")
-                    # If we didn't cash out and the play button is back, we must have crashed.
                     return 0.0
 
             # 2. Get CASHOUT and GO buttons
-            cashout_btn = await self._find_element("cashout_button", timeout=500)
-            go_btn = await self._find_element("go_button", timeout=500)
+            cashout_btn = await self._find_element("cashout_button", timeout=0)
+            go_btn = await self._find_element("go_button", timeout=0)
 
-            if not cashout_btn or not go_btn:
-                await asyncio.sleep(0.5)
-                continue
+            if not cashout_btn and not go_btn:
+                # Fuzzy verification: wait 300ms to see if it's a page lag
+                await asyncio.sleep(0.3)
+                cashout_btn = await self._find_element("cashout_button", timeout=0)
+                go_btn = await self._find_element("go_button", timeout=0)
+                if not cashout_btn and not go_btn:
+                    logger.info("Both GO and CASHOUT buttons disappeared. Round ended.")
+                    return last_multiplier
 
             # 3. Read current multiplier from CASHOUT button text
-            try:
-                cashout_text = await cashout_btn.inner_text()
-                current_multiplier = self._parse_multiplier_from_cashout(cashout_text, stake)
-            except Exception as e:
-                logger.warning(f"Failed to read cashout text: {e}")
-                current_multiplier = 0.0
+            current_multiplier = 0.0
+            if cashout_btn:
+                try:
+                    cashout_text = await cashout_btn.inner_text()
+                    current_multiplier = self._parse_multiplier_from_cashout(cashout_text, stake)
+                except Exception as e:
+                    logger.warning(f"Failed to read cashout text: {e}")
 
             if current_multiplier > 0:
                 last_multiplier = current_multiplier
@@ -302,45 +337,66 @@ class BetExecutor:
             logger.info(f"Current multiplier: {current_multiplier}x, Last multiplier: {last_multiplier}x, Target: {target}x")
 
             # 4. Decide action:
-            # If current_multiplier is >= target, click CASHOUT!
-            if current_multiplier >= target:
+            action = None
+            reasoning = ""
+            confidence = 50.0
+            risk_level = "medium"
+
+            if step_decider and current_multiplier > 0:
+                step_res = step_decider(current_multiplier)
+                action = step_res.get("action")  # "move" or "cashout"
+                reasoning = step_res.get("reasoning", "")
+                confidence = step_res.get("confidence", 50.0)
+                risk_level = step_res.get("risk_level", "medium")
+                
+                logger.info(f"AI Thinking step at {current_multiplier}x: {reasoning} (Decision: {action.upper()})")
+                if self._on_step_decision:
+                    self._on_step_decision(current_multiplier, action, reasoning, confidence, risk_level)
+            else:
+                # Fallback to standard target multiplier check
+                if current_multiplier >= target:
+                    action = "cashout"
+                else:
+                    action = "move"
+
+            if action == "cashout" and cashout_btn:
                 is_cashout_disabled = await cashout_btn.is_disabled()
                 if not is_cashout_disabled:
-                    logger.info(f"Target reached: {current_multiplier}x >= {target}x. Clicking CASHOUT.")
+                    logger.info(f"Cashing out at {current_multiplier}x. Clicking CASHOUT.")
                     try:
                         await cashout_btn.click()
                         # Wait to ensure the cashout registers and round ends
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(1.5)
                         return current_multiplier
                     except Exception as e:
                         logger.warning(f"Failed to click CASHOUT: {e}")
                 else:
-                    logger.info("Target reached but CASHOUT button is disabled (waiting...)")
+                    logger.info("Cashout requested but CASHOUT button is disabled (waiting...)")
 
-            # Otherwise, click GO to advance
-            else:
+            elif action == "move" and go_btn:
                 is_go_disabled = await go_btn.is_disabled()
                 if not is_go_disabled:
-                    logger.info(f"Multiplier {current_multiplier}x < {target}x. Clicking GO.")
+                    logger.info(f"Moving forward from {current_multiplier}x. Clicking GO.")
                     try:
                         await go_btn.click()
-                        # Wait for step animation/resolution (1.5 seconds)
-                        await asyncio.sleep(1.5)
+                        # Wait for step animation/resolution
+                        await asyncio.sleep(1.2)
                     except Exception as e:
                         logger.warning(f"Failed to click GO: {e}")
                 else:
                     # GO is disabled. Check if we can cash out what we have
-                    is_cashout_disabled = await cashout_btn.is_disabled()
-                    if not is_cashout_disabled and current_multiplier > 0:
-                        logger.info("GO is disabled but CASHOUT is active. Cashing out what we have.")
-                        try:
-                            await cashout_btn.click()
-                            await asyncio.sleep(2.0)
-                            return current_multiplier
-                        except Exception as e:
-                            logger.warning(f"Failed to click CASHOUT: {e}")
+                    if cashout_btn:
+                        is_cashout_disabled = await cashout_btn.is_disabled()
+                        if not is_cashout_disabled and current_multiplier > 0:
+                            logger.info("GO is disabled but CASHOUT is active. Cashing out what we have.")
+                            try:
+                                await cashout_btn.click()
+                                await asyncio.sleep(1.5)
+                                return current_multiplier
+                            except Exception as e:
+                                logger.warning(f"Failed to click CASHOUT: {e}")
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
         logger.warning("Monitoring timed out")
         return last_multiplier
@@ -382,7 +438,7 @@ class BetExecutor:
             pass
         return None
 
-    async def _observe_round_outcome(self, target_multiplier: float) -> float:
+    async def _observe_round_outcome(self, target_multiplier: float, step_decider: Optional[Callable[[float], dict]] = None) -> float:
         """
         [Dry-run only] Simulate a round's outcome with realistic step-by-step delays.
         """
@@ -394,6 +450,32 @@ class BetExecutor:
 
         # Simulate each step
         for step_mult in multipliers:
+            action = None
+            reasoning = ""
+            confidence = 50.0
+            risk_level = "medium"
+
+            if step_decider and sim_multiplier > 0:
+                step_res = step_decider(sim_multiplier)
+                action = step_res.get("action")
+                reasoning = step_res.get("reasoning", "")
+                confidence = step_res.get("confidence", 50.0)
+                risk_level = step_res.get("risk_level", "medium")
+                
+                logger.info(f"[DRY RUN] AI Thinking step at {sim_multiplier}x: {reasoning} (Decision: {action.upper()})")
+                if self._on_step_decision:
+                    self._on_step_decision(sim_multiplier, action, reasoning, confidence, risk_level)
+            else:
+                if sim_multiplier >= target_multiplier:
+                    action = "cashout"
+                else:
+                    action = "move"
+
+            if action == "cashout":
+                logger.info(f"[DRY RUN] Simulating 'CASHOUT' at {sim_multiplier}x.")
+                await asyncio.sleep(1.0)
+                return sim_multiplier
+
             logger.info(f"[DRY RUN] Simulating click 'GO'...")
             await asyncio.sleep(1.2) # Simulate delay
 
@@ -401,10 +483,6 @@ class BetExecutor:
             if random.random() < 0.88:
                 sim_multiplier = step_mult
                 logger.info(f"[DRY RUN] Safe! Current multiplier: {sim_multiplier}x")
-                if sim_multiplier >= target_multiplier:
-                    logger.info(f"[DRY RUN] Target reached. Simulating 'CASHOUT' at {sim_multiplier}x.")
-                    await asyncio.sleep(1.0)
-                    return sim_multiplier
             else:
                 logger.info(f"[DRY RUN] Exploded! Crashed at {sim_multiplier}x")
                 return 0.0 # Loss

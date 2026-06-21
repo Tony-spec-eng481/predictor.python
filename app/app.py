@@ -25,7 +25,7 @@ from config import get_config
 from models import db, RoadWorxRound, AIBetLog
 from playwright_collector import PlaywrightRoadWorxCollector
 from provably_fair import verify_round as pf_verify
-from ai_engine import AIStrategyEngine, AIConfig, AIDecision, SessionStats
+from ai_engine import AIStrategyEngine, AIConfig
 from bet_executor import BetExecutor
 
 # Load environment variables from .env
@@ -67,9 +67,30 @@ collector = PlaywrightRoadWorxCollector(api_url=internal_api)
 # --- AI Engine & Executor ---
 ai_engine: AIStrategyEngine = None  # Initialized after app context is ready
 bet_executor = BetExecutor(dry_run=True)
-ai_session_thread = None
-ai_stop_event = threading.Event()
-ai_bet_in_progress = False
+
+def _on_ai_step_decision(multiplier: float, action: str, reasoning: str, confidence: float, risk_level: str):
+    """Callback when the AI makes a step decision (move or cashout) during execution."""
+    global ai_engine
+    if not ai_engine:
+        return
+        
+    with app.app_context():
+        # Map step action to a format the UI expects for target/action updates
+        ui_action = "bet" if action == "move" else "cashout"
+        decision_dict = {
+            "action": ui_action,
+            "stake": round(ai_engine.stats.current_balance * 0.10, 2),
+            "target_multiplier": 1.44 if multiplier < 1.44 else 2.30,
+            "confidence": confidence,
+            "reasoning": f"[At {multiplier:.2f}x] {reasoning}",
+            "risk_level": risk_level,
+            "analysis": ai_engine.get_latest_analysis()
+        }
+        socketio.emit('ai_decision', decision_dict)
+
+bet_executor.on_step_decision = _on_ai_step_decision
+
+ai_task = None
 last_trained_db_count = 0
 is_bg_training = False
 bg_training_lock = threading.Lock()
@@ -83,31 +104,6 @@ def _push_multiplier(data):
 
         # Always emit status update for the live ticker
         socketio.emit('status_update', _get_enhanced_status())
-
-        # If AI is running, feed it the new multiplier for decision
-        if ai_engine and ai_engine.stats.is_running and data.get('is_final'):
-            _ai_process_round(data.get('multiplier'))
-
-            # Live mode: sync the real browser balance to the AI after each round
-            if not ai_engine.config.dry_run and collector.page and hasattr(collector, 'loop') and collector.loop:
-                def _sync_balance_bg():
-                    try:
-                        import asyncio as _asyncio
-                        future = _asyncio.run_coroutine_threadsafe(
-                            bet_executor.get_current_balance(), collector.loop
-                        )
-                        real_bal = future.result(timeout=6.0)
-                        if real_bal is not None and ai_engine and ai_engine.stats.is_running:
-                            ai_engine.stats.current_balance = real_bal
-                            ai_engine.stats.total_profit_loss = real_bal - ai_engine.stats.starting_balance
-                            ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_bal)
-                            ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_bal)
-                            with app.app_context():
-                                socketio.emit('ai_status_update', ai_engine.stats.to_dict())
-                            logger.info(f"Periodic balance sync: {real_bal} KES")
-                    except Exception as _e:
-                        logger.debug(f"Balance sync skipped: {_e}")
-                threading.Thread(target=_sync_balance_bg, daemon=True).start()
 
 collector.on_multiplier = _push_multiplier
 
@@ -222,10 +218,8 @@ def add_multiplier():
     socketio.emit('new_multiplier', payload)
     socketio.emit('status_update', collector.get_status())
     
-    # Trigger AI process round if AI is running
-    if ai_engine and ai_engine.stats.is_running:
-        _ai_process_round(multiplier)
-    else:
+    # Trigger training checks if AI is not actively running (it does this inline in the execution loop otherwise)
+    if not (ai_engine and ai_engine.stats.is_running):
         _check_automated_training()
         
     return jsonify(payload)
@@ -814,112 +808,195 @@ def _init_ai_engine():
         last_trained_db_count = 0
 
 
-async def run_bet_in_background(decision):
-    global ai_bet_in_progress
-    try:
-        logger.info(f"Running bet execution in background for stake: {decision.stake}, target: {decision.target_multiplier}")
-        result = await bet_executor.execute_bet(decision.stake, decision.target_multiplier)
+async def ai_execution_loop():
+    """
+    Main linear execution loop for the AI bet trader.
+    Runs sequentially on the collector's event loop to ensure thread safety
+    and prevent concurrent task overlapping.
+    """
+    global ai_engine, bet_executor
+    logger.info("AI execution loop started.")
 
-        # --- LIVE MODE: Sync real game balance from the browser ---
-        # After the bet resolves, read the actual balance shown in the game website
-        # and push it back into the AI engine so both displays stay in sync.
-        real_balance_after = None
-        if not ai_engine.config.dry_run and bet_executor.page:
-            try:
-                real_balance_after = await bet_executor.get_current_balance()
-                if real_balance_after is not None:
-                    logger.info(f"Real game balance after bet: {real_balance_after} KES")
-            except Exception as bal_err:
-                logger.warning(f"Could not read game balance after bet: {bal_err}")
+    while ai_engine and ai_engine.stats.is_running:
+        try:
+            # 1. Wait for bet phase
+            await bet_executor._wait_for_bet_phase(max_wait=60)
+            
+            # Double check running state
+            if not ai_engine.stats.is_running:
+                break
 
-        with app.app_context():
-            actual = result.get("actual_multiplier", 1.0)
-            won = result.get("won", False)
-            profit = result.get("profit", -decision.stake)
-            outcome = "win" if won else "loss"
-            if result.get("error"):
-                outcome = "error"
-                logger.error(f"Bet execution failed: {result['error']}")
+            # 2. Sync real game balance from the browser before making decision
+            real_bal = None
+            if not ai_engine.config.dry_run:
+                try:
+                    real_bal = await bet_executor.get_current_balance()
+                    if real_bal is not None:
+                        ai_engine.stats.current_balance = real_bal
+                        ai_engine.stats.total_profit_loss = real_bal - ai_engine.stats.starting_balance
+                        ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_bal)
+                        ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_bal)
+                        with app.app_context():
+                            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+                        logger.info(f"Synced balance before decision: {real_bal} KES")
+                except Exception as bal_err:
+                    logger.warning(f"Could not sync balance before decision: {bal_err}")
+
+            # 3. Retrieve recent multipliers from database for analysis
+            with app.app_context():
+                recent = (
+                    db.session.query(RoadWorxRound.multiplier)
+                    .order_by(RoadWorxRound.timestamp.desc())
+                    .limit(ai_engine.config.analysis_window)
+                    .all()
+                )
+                mult_list = [r[0] for r in recent]
+
+            # 4. Make a decision
+            decision = ai_engine.make_decision(mult_list)
+            
+            # Emit decision to frontend
+            with app.app_context():
+                socketio.emit('ai_decision', decision.to_dict())
 
             balance_before = ai_engine.stats.current_balance
-            ai_engine.record_outcome(actual, decision)
 
-            # Override internal balance with the REAL browser balance (live mode only)
-            if real_balance_after is not None:
-                ai_engine.stats.current_balance = real_balance_after
-                ai_engine.stats.total_profit_loss = real_balance_after - ai_engine.stats.starting_balance
-                ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_balance_after)
-                ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_balance_after)
-                # Append the corrected real balance to the equity curve
-                ai_engine.stats.equity_curve.append(round(real_balance_after, 2))
-                logger.info(f"AI balance synced to real game balance: {real_balance_after} KES")
+            # 5. Handle action
+            if decision.action == 'bet':
+                logger.info(f"AI Decision: BET {decision.stake} KES, target: {decision.target_multiplier}")
+                
+                # Define step decider function for the executor
+                def step_decider_func(current_multiplier):
+                    return ai_engine.make_step_decision(current_multiplier, mult_list)
 
-            log_entry = AIBetLog(
-                action='bet',
-                stake=decision.stake,
-                target_multiplier=decision.target_multiplier,
-                actual_multiplier=actual,
-                profit_loss=profit,
-                balance_before=balance_before,
-                balance_after=ai_engine.stats.current_balance,
-                confidence=decision.confidence,
-                risk_level=decision.risk_level,
-                reasoning=decision.reasoning + (f" | Error: {result['error']}" if result.get("error") else ""),
-                analysis_snapshot=json.dumps(decision.analysis) if decision.analysis else None,
-                outcome=outcome,
-                session_id=ai_engine.stats.session_id,
-                is_dry_run=ai_engine.config.dry_run,
-            )
-            db.session.add(log_entry)
-            db.session.commit()
+                # Execute the bet and wait for it to resolve
+                result = await bet_executor.execute_bet(decision.stake, decision.target_multiplier, step_decider=step_decider_func)
+                
+                actual = result.get("actual_multiplier", 1.0)
+                won = result.get("won", False)
+                profit = result.get("profit", -decision.stake)
+                outcome = "win" if won else "loss"
+                if result.get("error"):
+                    outcome = "error"
+                    logger.error(f"Bet execution failed: {result['error']}")
 
-            socketio.emit('ai_trade_result', {
-                'outcome': outcome,
-                'stake': decision.stake,
-                'target': decision.target_multiplier,
-                'actual': actual,
-                'profit_loss': round(profit, 2),
-                'balance': round(ai_engine.stats.current_balance, 2),
-                'is_dry_run': ai_engine.config.dry_run,
-            })
-            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+                # Update balance after bet
+                ai_engine.record_outcome(actual, decision)
 
-            if not result.get("error"):
-                # Insert the round into the DB so we accumulate history
-                source_name = 'ai_bet_executor_dry' if ai_engine.config.dry_run else 'ai_bet_executor_live'
-                round_entry = RoadWorxRound(
-                    multiplier=actual,
-                    source=source_name,
-                    game_round_id=f"ai_{int(time.time())}",
-                    session_id=ai_engine.stats.session_id
-                )
-                db.session.add(round_entry)
-                db.session.commit()
+                # Sync real balance after bet
+                if not ai_engine.config.dry_run:
+                    try:
+                        real_bal_after = await bet_executor.get_current_balance()
+                        if real_bal_after is not None:
+                            ai_engine.stats.current_balance = real_bal_after
+                            ai_engine.stats.total_profit_loss = real_bal_after - ai_engine.stats.starting_balance
+                            ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_bal_after)
+                            ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_bal_after)
+                            ai_engine.stats.equity_curve.append(round(real_bal_after, 2))
+                            logger.info(f"Synced balance after bet: {real_bal_after} KES")
+                    except Exception as bal_err:
+                        logger.warning(f"Could not sync balance after bet: {bal_err}")
 
-                # Trigger next round decision cycle
-                def trigger_next():
-                    time.sleep(3)
-                    with app.app_context():
-                        if ai_engine and ai_engine.stats.is_running:
-                            logger.info("Triggering next AI decision cycle after bet completion.")
-                            _ai_process_round(actual)
-                threading.Thread(target=trigger_next, daemon=True).start()
-            else:
-                # If the bet execution failed with an error, trigger the next round check after a delay to keep the loop alive
-                def trigger_next_after_error():
-                    time.sleep(5)
-                    with app.app_context():
-                        if ai_engine and ai_engine.stats.is_running:
-                            logger.info("Retrying AI decision cycle after bet execution error.")
-                            _ai_process_round(1.0)
-                threading.Thread(target=trigger_next_after_error, daemon=True).start()
+                with app.app_context():
+                    log_entry = AIBetLog(
+                        action='bet',
+                        stake=decision.stake,
+                        target_multiplier=decision.target_multiplier,
+                        actual_multiplier=actual,
+                        profit_loss=profit,
+                        balance_before=balance_before,
+                        balance_after=ai_engine.stats.current_balance,
+                        confidence=decision.confidence,
+                        risk_level=decision.risk_level,
+                        reasoning=decision.reasoning + (f" | Error: {result['error']}" if result.get("error") else ""),
+                        analysis_snapshot=json.dumps(decision.analysis) if decision.analysis else None,
+                        outcome=outcome,
+                        session_id=ai_engine.stats.session_id,
+                        is_dry_run=ai_engine.config.dry_run,
+                    )
+                    db.session.add(log_entry)
+                    db.session.commit()
 
-    except Exception as e:
-        logger.error(f"Exception in run_bet_in_background: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        ai_bet_in_progress = False
+                    socketio.emit('ai_trade_result', {
+                        'outcome': outcome,
+                        'stake': decision.stake,
+                        'target': decision.target_multiplier,
+                        'actual': actual,
+                        'profit_loss': round(profit, 2),
+                        'balance': round(ai_engine.stats.current_balance, 2),
+                        'is_dry_run': ai_engine.config.dry_run,
+                    })
+                    socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+                    if not result.get("error"):
+                        # Save round into database history
+                        source_name = 'ai_bet_executor_dry' if ai_engine.config.dry_run else 'ai_bet_executor_live'
+                        round_entry = RoadWorxRound(
+                            multiplier=actual,
+                            source=source_name,
+                            game_round_id=f"ai_{int(time.time())}",
+                            session_id=ai_engine.stats.session_id
+                        )
+                        db.session.add(round_entry)
+                        db.session.commit()
+
+                # Sleep a short post-round cooldown
+                await asyncio.sleep(2.0)
+
+            elif decision.action == 'skip':
+                logger.info(f"AI Decision: SKIP. Reasoning: {decision.reasoning}")
+                ai_engine.record_outcome(multiplier=1.0, decision=decision)
+                
+                with app.app_context():
+                    log_entry = AIBetLog(
+                        action='skip',
+                        confidence=decision.confidence,
+                        reasoning=decision.reasoning,
+                        outcome='skipped',
+                        session_id=ai_engine.stats.session_id,
+                        is_dry_run=ai_engine.config.dry_run,
+                        actual_multiplier=1.0,
+                        balance_before=balance_before,
+                        balance_after=ai_engine.stats.current_balance,
+                    )
+                    db.session.add(log_entry)
+                    db.session.commit()
+                    
+                    socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+                # Sleep before checking the next round
+                await asyncio.sleep(3.0)
+
+            elif decision.action == 'stop_session':
+                logger.info(f"AI Decision: STOP. Reasoning: {decision.reasoning}")
+                ai_engine.stop_session(reason=decision.reasoning)
+                
+                with app.app_context():
+                    log_entry = AIBetLog(
+                        action='stop_session',
+                        reasoning=decision.reasoning,
+                        outcome='session_stopped',
+                        session_id=ai_engine.stats.session_id,
+                        is_dry_run=ai_engine.config.dry_run,
+                        balance_before=balance_before,
+                        balance_after=ai_engine.stats.current_balance,
+                    )
+                    db.session.add(log_entry)
+                    db.session.commit()
+                    
+                    socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+                break
+
+            # Trigger automated background self-training check
+            _check_automated_training()
+
+        except Exception as e:
+            logger.error(f"Error in AI execution loop: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(5.0)
+
+    logger.info("AI execution loop stopped.")
 
 
 def run_bg_training_job():
@@ -1032,134 +1109,7 @@ def _check_automated_training():
         threading.Thread(target=run_bg_training_job, daemon=True).start()
 
 
-def _ai_process_round(multiplier: float):
-    """Called each time a final multiplier is captured. Drives the AI loop."""
-    global ai_engine, ai_bet_in_progress
-    if not ai_engine or not ai_engine.stats.is_running:
-        return
-
-    if ai_bet_in_progress:
-        logger.info("AI bet is currently in progress, skipping analysis for this round.")
-        return
-
-    try:
-        # Fetch recent multipliers from DB
-        recent = (
-            db.session.query(RoadWorxRound.multiplier)
-            .order_by(RoadWorxRound.timestamp.desc())
-            .limit(ai_engine.config.analysis_window)
-            .all()
-        )
-        mult_list = [r[0] for r in recent]
-
-        # Make decision
-        decision = ai_engine.make_decision(mult_list)
-
-        # Emit decision to frontend
-        socketio.emit('ai_decision', decision.to_dict())
-
-        # Record in DB
-        balance_before = ai_engine.stats.current_balance
-
-        if decision.action == 'bet':
-            # Execute bet asynchronously on the collector loop
-            if collector.is_running and hasattr(collector, 'loop') and collector.loop and collector.page:
-                bet_executor.set_page(collector.page)
-                bet_executor.dry_run = ai_engine.config.dry_run
-                
-                ai_bet_in_progress = True
-                asyncio.run_coroutine_threadsafe(run_bet_in_background(decision), collector.loop)
-                logger.info("Spawned background bet execution task.")
-            else:
-                # Fallback: collector not running or loop not initialized, simulate
-                logger.warning("Collector or event loop not running. Simulating bet outcome.")
-                actual = multiplier
-                ai_engine.record_outcome(actual, decision)
-
-                outcome = 'win' if actual >= decision.target_multiplier else 'loss'
-                profit = (decision.stake * decision.target_multiplier - decision.stake) if outcome == 'win' else -decision.stake
-
-                log_entry = AIBetLog(
-                    action='bet',
-                    stake=decision.stake,
-                    target_multiplier=decision.target_multiplier,
-                    actual_multiplier=actual,
-                    profit_loss=profit,
-                    balance_before=balance_before,
-                    balance_after=ai_engine.stats.current_balance,
-                    confidence=decision.confidence,
-                    risk_level=decision.risk_level,
-                    reasoning=decision.reasoning + " (Simulated fallback)",
-                    analysis_snapshot=json.dumps(decision.analysis) if decision.analysis else None,
-                    outcome=outcome,
-                    session_id=ai_engine.stats.session_id,
-                    is_dry_run=ai_engine.config.dry_run,
-                )
-                db.session.add(log_entry)
-                db.session.commit()
-
-                socketio.emit('ai_trade_result', {
-                    'outcome': outcome,
-                    'stake': decision.stake,
-                    'target': decision.target_multiplier,
-                    'actual': actual,
-                    'profit_loss': round(profit, 2),
-                    'balance': round(ai_engine.stats.current_balance, 2),
-                    'is_dry_run': ai_engine.config.dry_run,
-                })
-
-        elif decision.action == 'skip':
-            ai_engine.record_outcome(multiplier, decision)
-            log_entry = AIBetLog(
-                action='skip',
-                confidence=decision.confidence,
-                reasoning=decision.reasoning,
-                outcome='skipped',
-                session_id=ai_engine.stats.session_id,
-                is_dry_run=ai_engine.config.dry_run,
-                actual_multiplier=multiplier,
-                balance_before=balance_before,
-                balance_after=ai_engine.stats.current_balance,
-            )
-            db.session.add(log_entry)
-            db.session.commit()
-
-            # Since it's a single-player game, a skip would stall the loop.
-            # We schedule a new decision check after a short delay (e.g. 5 seconds)
-            def trigger_next_after_skip():
-                time.sleep(5)
-                with app.app_context():
-                    if ai_engine and ai_engine.stats.is_running:
-                        logger.info("Triggering next AI decision cycle after skip.")
-                        _ai_process_round(1.0)
-            
-            threading.Thread(target=trigger_next_after_skip, daemon=True).start()
-
-        elif decision.action == 'stop_session':
-            ai_engine.stop_session(reason=decision.reasoning)
-            log_entry = AIBetLog(
-                action='stop_session',
-                reasoning=decision.reasoning,
-                outcome='session_stopped',
-                session_id=ai_engine.stats.session_id,
-                is_dry_run=ai_engine.config.dry_run,
-                balance_before=balance_before,
-                balance_after=ai_engine.stats.current_balance,
-            )
-            db.session.add(log_entry)
-            db.session.commit()
-            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
-
-        # Push updated stats
-        socketio.emit('ai_status_update', ai_engine.stats.to_dict())
-
-        # Check for automated background self-training
-        _check_automated_training()
-
-    except Exception as e:
-        logger.error(f"AI process round error: {e}")
-        import traceback
-        traceback.print_exc()
+# _ai_process_round is deprecated, replaced by ai_execution_loop
 
 
 @app.route('/api/ai/status', methods=['GET'])
@@ -1272,14 +1222,12 @@ def ai_start():
     socketio.emit('ai_status_update', ai_engine.stats.to_dict())
     socketio.emit('collection_status', collector.get_status())
     
-    # Trigger first AI round check in the background so we don't block the start HTTP response
-    def trigger_initial():
-        time.sleep(1)
-        with app.app_context():
-            if ai_engine and ai_engine.stats.is_running:
-                logger.info("Triggering initial AI decision cycle.")
-                _ai_process_round(1.0)
-    threading.Thread(target=trigger_initial, daemon=True).start()
+    global ai_task
+    if collector.is_running and hasattr(collector, 'loop') and collector.loop:
+        ai_task = asyncio.run_coroutine_threadsafe(ai_execution_loop(), collector.loop)
+        logger.info("Launched linear AI execution loop on Playwright event loop.")
+    else:
+        logger.error("Failed to launch AI execution loop: Playwright collector is not running.")
 
     return jsonify({
         'status': 'started',
@@ -1540,7 +1488,8 @@ if __name__ == '__main__':
             debug=cfg.DEBUG, 
             host=cfg.HOST, 
             port=cfg.PORT, 
-            use_reloader=False
+            use_reloader=False,
+            allow_unsafe_werkzeug=True
         )
     else:
         # In production, this script should generally NOT be run directly.
