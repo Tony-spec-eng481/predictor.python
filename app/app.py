@@ -1544,6 +1544,20 @@ if __name__ == '__main__':
         )
     else:
         # In production, this script should generally NOT be run directly.
-        # Use a WSGI server like Gunicorn: gunicorn wsgi:application
-        logger.warning("Running production mode with development server is NOT recommended.")
-        socketio.run(app, host=cfg.HOST, port=cfg.PORT)
+        # We start a production-grade gevent WSGI server if possible, or fall back safely.
+        logger.warning("Running production mode. Attempting to start server...")
+        try:
+            from gevent import pywsgi
+            from geventwebsocket.handler import WebSocketHandler
+            logger.info("Starting gevent WSGI/WebSocket server...")
+            server = pywsgi.WSGIServer((cfg.HOST, cfg.PORT), app, handler_class=WebSocketHandler)
+            server.serve_forever()
+        except Exception as e:
+            logger.warning(f"Could not start gevent server: {e}. Falling back to Werkzeug development server.")
+            socketio.run(
+                app, 
+                host=cfg.HOST, 
+                port=cfg.PORT, 
+                allow_unsafe_werkzeug=True
+            )
+
