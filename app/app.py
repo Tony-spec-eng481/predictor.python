@@ -7,6 +7,7 @@ import asyncio
 import time
 import io
 import csv
+import json
 import logging
 import statistics
 from datetime import datetime
@@ -17,9 +18,11 @@ from sqlalchemy import func, inspect
 from dotenv import load_dotenv
 
 from config import get_config
-from models import db, AviatorRound
-from playwright_collector import PlaywrightAviatorCollector
+from models import db, RoadWorxRound, AIBetLog
+from playwright_collector import PlaywrightRoadWorxCollector
 from provably_fair import verify_round as pf_verify
+from ai_engine import AIStrategyEngine, AIConfig, AIDecision, SessionStats
+from bet_executor import BetExecutor
 
 # Load environment variables from .env
 load_dotenv()
@@ -51,16 +54,48 @@ socketio = SocketIO(
 
 # Use configured internal API URL for collector if provided
 internal_api = f"http://{cfg.HOST}:{cfg.PORT}/api/multiplier"
-collector = PlaywrightAviatorCollector(api_url=internal_api)
+collector = PlaywrightRoadWorxCollector(api_url=internal_api)
+
+# --- AI Engine & Executor ---
+ai_engine: AIStrategyEngine = None  # Initialized after app context is ready
+bet_executor = BetExecutor(dry_run=True)
+ai_session_thread = None
+ai_stop_event = threading.Event()
+ai_bet_in_progress = False
 
 def _push_multiplier(data):
     with app.app_context():
         # Only emit 'new_multiplier' for final results (to add to history log)
         if data.get('is_final'):
             socketio.emit('new_multiplier', data)
-        
+
         # Always emit status update for the live ticker
         socketio.emit('status_update', _get_enhanced_status())
+
+        # If AI is running, feed it the new multiplier for decision
+        if ai_engine and ai_engine.stats.is_running and data.get('is_final'):
+            _ai_process_round(data.get('multiplier'))
+
+            # Live mode: sync the real browser balance to the AI after each round
+            if not ai_engine.config.dry_run and collector.page and hasattr(collector, 'loop') and collector.loop:
+                def _sync_balance_bg():
+                    try:
+                        import asyncio as _asyncio
+                        future = _asyncio.run_coroutine_threadsafe(
+                            bet_executor.get_current_balance(), collector.loop
+                        )
+                        real_bal = future.result(timeout=6.0)
+                        if real_bal is not None and ai_engine and ai_engine.stats.is_running:
+                            ai_engine.stats.current_balance = real_bal
+                            ai_engine.stats.total_profit_loss = real_bal - ai_engine.stats.starting_balance
+                            ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_bal)
+                            ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_bal)
+                            with app.app_context():
+                                socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+                            logger.info(f"Periodic balance sync: {real_bal} KES")
+                    except Exception as _e:
+                        logger.debug(f"Balance sync skipped: {_e}")
+                threading.Thread(target=_sync_balance_bg, daemon=True).start()
 
 collector.on_multiplier = _push_multiplier
 
@@ -68,7 +103,7 @@ def migrate_db():
     with app.app_context():
         db.create_all()
         inspector = inspect(db.engine)
-        existing = [c['name'] for c in inspector.get_columns('aviator_round')]
+        existing = [c['name'] for c in inspector.get_columns('road_worx_round')]
         new_cols = {
             'game_round_id': 'VARCHAR(64)',
             'server_seed_hash': 'VARCHAR(128)',
@@ -84,7 +119,7 @@ def migrate_db():
             if col not in existing:
                 try:
                     db.session.execute(
-                        db.text(f"ALTER TABLE aviator_round ADD COLUMN {col} {col_type}")
+                        db.text(f"ALTER TABLE road_worx_round ADD COLUMN {col} {col_type}")
                     )
                 except:
                     pass
@@ -124,7 +159,7 @@ def add_multiplier():
     
     # 1. Check by Round ID first (absolute deduplication)
     if game_round_id:
-        existing_by_id = AviatorRound.query.filter_by(game_round_id=game_round_id).first()
+        existing_by_id = RoadWorxRound.query.filter_by(game_round_id=game_round_id).first()
         if existing_by_id:
             return jsonify(existing_by_id.to_dict()), 200
 
@@ -132,11 +167,11 @@ def add_multiplier():
     # This handles cases where we get the same result twice (e.g. once without ID, once with ID)
     recent_limit = datetime.utcnow()
     # Look back 15 seconds
-    existing_recent = AviatorRound.query.filter(
-        AviatorRound.multiplier >= multiplier - 0.001,
-        AviatorRound.multiplier <= multiplier + 0.001,
-        AviatorRound.timestamp >= datetime.fromtimestamp(datetime.utcnow().timestamp() - 15)
-    ).order_by(AviatorRound.timestamp.desc()).first()
+    existing_recent = RoadWorxRound.query.filter(
+        RoadWorxRound.multiplier >= multiplier - 0.001,
+        RoadWorxRound.multiplier <= multiplier + 0.001,
+        RoadWorxRound.timestamp >= datetime.fromtimestamp(datetime.utcnow().timestamp() - 15)
+    ).order_by(RoadWorxRound.timestamp.desc()).first()
 
     if existing_recent:
         # If we just got an ID for a round that didn't have one, update it!
@@ -148,7 +183,7 @@ def add_multiplier():
         # Otherwise, it's just a duplicate
         return jsonify(existing_recent.to_dict()), 200
 
-    round_data = AviatorRound(
+    round_data = RoadWorxRound(
         multiplier=multiplier,
         source=data.get('source', 'playwright_ws'),
         game_round_id=data.get('game_round_id'),
@@ -166,13 +201,51 @@ def add_multiplier():
     payload = round_data.to_dict()
     socketio.emit('new_multiplier', payload)
     socketio.emit('status_update', collector.get_status())
+    
+    # Trigger AI process round if AI is running
+    if ai_engine and ai_engine.stats.is_running:
+        _ai_process_round(multiplier)
+        
     return jsonify(payload)
 
 @app.route('/api/multipliers')
 def get_multipliers():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
-    query = AviatorRound.query.order_by(AviatorRound.timestamp.desc())
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    min_multiplier = request.args.get('min_multiplier')
+    max_multiplier = request.args.get('max_multiplier')
+
+    query = RoadWorxRound.query
+
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            query = query.filter(RoadWorxRound.timestamp >= start_dt)
+        except ValueError:
+            pass
+
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date + ' 23:59:59', '%Y-%m-%d %H:%M:%S')
+            query = query.filter(RoadWorxRound.timestamp <= end_dt)
+        except ValueError:
+            pass
+
+    if min_multiplier:
+        try:
+            query = query.filter(RoadWorxRound.multiplier >= float(min_multiplier))
+        except ValueError:
+            pass
+
+    if max_multiplier:
+        try:
+            query = query.filter(RoadWorxRound.multiplier <= float(max_multiplier))
+        except ValueError:
+            pass
+
+    query = query.order_by(RoadWorxRound.timestamp.desc())
     total = query.count()
     multipliers = query.paginate(page=page, per_page=per_page, error_out=False)
     return jsonify({
@@ -184,7 +257,7 @@ def get_multipliers():
 
 @app.route('/api/stats')
 def get_stats():
-    query = db.session.query(AviatorRound.multiplier).all()
+    query = db.session.query(RoadWorxRound.multiplier).all()
     multipliers = [m[0] for m in query]
     
     if not multipliers:
@@ -194,23 +267,28 @@ def get_stats():
             'median_multiplier': 0,
             'min_multiplier': 0,
             'max_multiplier': 0,
-            'last_multiplier': 0
+            'last_multiplier': 0,
+            'low_multiplier_prob': 0
         })
     
-    last_round = AviatorRound.query.order_by(AviatorRound.timestamp.desc()).first()
-    recent_multipliers = db.session.query(AviatorRound.multiplier).order_by(AviatorRound.timestamp.desc()).limit(50).all()
+    last_round = RoadWorxRound.query.order_by(RoadWorxRound.timestamp.desc()).first()
+    recent_multipliers = db.session.query(RoadWorxRound.multiplier).order_by(RoadWorxRound.timestamp.desc()).limit(50).all()
     
     # 24-hour Trend analysis
     one_day_ago = datetime.utcnow().timestamp() - 86400
     one_day_ago_dt = datetime.fromtimestamp(one_day_ago)
     
-    rounds_24h = AviatorRound.query.filter(AviatorRound.timestamp >= one_day_ago_dt).count()
-    avg_24h_query = db.session.query(func.avg(AviatorRound.multiplier)).filter(AviatorRound.timestamp >= one_day_ago_dt).scalar()
+    rounds_24h = RoadWorxRound.query.filter(RoadWorxRound.timestamp >= one_day_ago_dt).count()
+    avg_24h_query = db.session.query(func.avg(RoadWorxRound.multiplier)).filter(RoadWorxRound.timestamp >= one_day_ago_dt).scalar()
     avg_24h = float(avg_24h_query) if avg_24h_query else 0
     
     total_rounds_count = len(multipliers)
     overall_avg = statistics.mean(multipliers) if multipliers else 0
     
+    # Calculate crash rate (under 2.00x)
+    low_multiplier_count = len([m for m in multipliers if m < 2.0])
+    low_multiplier_prob = round((low_multiplier_count / total_rounds_count) * 100, 2) if total_rounds_count > 0 else 0
+
     rounds_trend = f"+{rounds_24h}" if rounds_24h > 0 else "0"
     avg_trend = round(avg_24h - overall_avg, 2)
     avg_trend_str = f"+{avg_trend}" if avg_trend > 0 else str(avg_trend)
@@ -224,6 +302,7 @@ def get_stats():
         'max_multiplier': round(max(multipliers), 2) if multipliers else 0,
         'last_multiplier': last_round.multiplier if last_round else 0,
         'recent_multipliers': [m[0] for m in recent_multipliers][::-1],
+        'low_multiplier_prob': low_multiplier_prob,
         'trends': {
             'rounds_24h': rounds_24h,
             'avg_24h': avg_24h
@@ -232,7 +311,7 @@ def get_stats():
 
 @app.route('/api/distribution')
 def get_distribution():
-    query = db.session.query(AviatorRound.multiplier).all()
+    query = db.session.query(RoadWorxRound.multiplier).all()
     multipliers = [m[0] for m in query]
     total = len(multipliers)
     
@@ -262,7 +341,7 @@ def get_distribution():
 
 @app.route('/api/probabilities')
 def get_probabilities():
-    query = db.session.query(AviatorRound.multiplier).all()
+    query = db.session.query(RoadWorxRound.multiplier).all()
     multipliers = [m[0] for m in query]
     total = len(multipliers)
     
@@ -289,7 +368,7 @@ def get_probabilities():
 @app.route('/api/predict')
 def predict():
     """
-    Advanced Aviator multiplier predictor combining:
+    Advanced Road Worx multiplier predictor combining:
     1. Provably-fair SHA-512 cryptographic analysis on stored rounds
     2. Nonce sequence extrapolation
     3. Statistical mean-reversion model
@@ -300,8 +379,8 @@ def predict():
 
     # ----- fetch recent rounds with provably fair data -----
     recent_rounds = (
-        AviatorRound.query
-        .order_by(AviatorRound.timestamp.desc())
+        RoadWorxRound.query
+        .order_by(RoadWorxRound.timestamp.desc())
         .limit(100)
         .all()
     )
@@ -451,8 +530,8 @@ def predict_crypto():
     import hashlib
 
     rounds = (
-        AviatorRound.query
-        .order_by(AviatorRound.timestamp.desc())
+        RoadWorxRound.query
+        .order_by(RoadWorxRound.timestamp.desc())
         .limit(30)
         .all()
     )
@@ -513,7 +592,7 @@ def predict_crypto():
 
 @app.route('/api/volatility')
 def get_volatility():
-    query = db.session.query(AviatorRound.multiplier).all()
+    query = db.session.query(RoadWorxRound.multiplier).all()
     multipliers = [m[0] for m in query]
     
     if len(multipliers) < 2:
@@ -534,7 +613,7 @@ def get_volatility():
 
 @app.route('/api/patterns')
 def get_patterns():
-    query = db.session.query(AviatorRound.multiplier).order_by(AviatorRound.timestamp.asc()).all()
+    query = db.session.query(RoadWorxRound.multiplier).order_by(RoadWorxRound.timestamp.asc()).all()
     multipliers = [m[0] for m in query]
     
     if not multipliers:
@@ -572,7 +651,7 @@ def simulate_strategy():
     base_bet = float(data.get('bet_size', 1.0))
     target = float(data.get('target', 2.0))
     
-    query = db.session.query(AviatorRound.multiplier).order_by(AviatorRound.timestamp.asc()).all()
+    query = db.session.query(RoadWorxRound.multiplier).order_by(RoadWorxRound.timestamp.asc()).all()
     multipliers = [m[0] for m in query]
     
     balance = start_balance
@@ -619,7 +698,7 @@ def simulate_strategy():
 @app.route('/api/multiplier/<int:round_id>', methods=['DELETE'])
 def delete_multiplier(round_id):
     try:
-        round_obj = AviatorRound.query.get(round_id)
+        round_obj = RoadWorxRound.query.get(round_id)
         if not round_obj:
             return jsonify({'error': 'Round not found'}), 404
         db.session.delete(round_obj)
@@ -632,7 +711,7 @@ def delete_multiplier(round_id):
 @app.route('/api/multipliers/clear', methods=['POST'])
 def clear_multipliers():
     try:
-        num_deleted = AviatorRound.query.delete()
+        num_deleted = RoadWorxRound.query.delete()
         db.session.commit()
         socketio.emit('history_cleared')
         return jsonify({'status': 'success', 'deleted': num_deleted})
@@ -644,9 +723,9 @@ def _get_enhanced_status():
     status = collector.get_status()
     try:
         # Get real DB count
-        status['collected_count'] = AviatorRound.query.count()
+        status['collected_count'] = RoadWorxRound.query.count()
         # Get truly last final multiplier from DB
-        last_final = AviatorRound.query.order_by(AviatorRound.timestamp.desc()).first()
+        last_final = RoadWorxRound.query.order_by(RoadWorxRound.timestamp.desc()).first()
         if last_final:
             status['last_crash'] = last_final.multiplier
     except:
@@ -680,6 +759,599 @@ def stop_collection():
     socketio.emit('collection_status', collector.get_status())
     return jsonify({'status': 'stopped'})
 
+# ===================================================================
+# AI TRADING ENDPOINTS
+# ===================================================================
+
+def _init_ai_engine():
+    """Initialize the AI engine with a DB session factory, loading optimized defaults."""
+    global ai_engine
+    from ai_engine import load_optimized_params
+    opt_params = load_optimized_params()
+    
+    config_dict = {
+        'risk_level': 'conservative',
+        'stop_loss_pct': 30.0,
+        'kelly_fraction': 0.25,
+        'dry_run': True,
+    }
+    # Load optimized defaults
+    config_dict.update(opt_params)
+    
+    ai_engine = AIStrategyEngine(
+        db_session_factory=db.session,
+        config=AIConfig.from_dict(config_dict),
+    )
+    logger.info("AI Strategy Engine initialized with optimized defaults")
+
+
+async def run_bet_in_background(decision):
+    global ai_bet_in_progress
+    try:
+        logger.info(f"Running bet execution in background for stake: {decision.stake}, target: {decision.target_multiplier}")
+        result = await bet_executor.execute_bet(decision.stake, decision.target_multiplier)
+
+        # --- LIVE MODE: Sync real game balance from the browser ---
+        # After the bet resolves, read the actual balance shown in the game website
+        # and push it back into the AI engine so both displays stay in sync.
+        real_balance_after = None
+        if not ai_engine.config.dry_run and bet_executor.page:
+            try:
+                real_balance_after = await bet_executor.get_current_balance()
+                if real_balance_after is not None:
+                    logger.info(f"Real game balance after bet: {real_balance_after} KES")
+            except Exception as bal_err:
+                logger.warning(f"Could not read game balance after bet: {bal_err}")
+
+        with app.app_context():
+            actual = result.get("actual_multiplier", 1.0)
+            won = result.get("won", False)
+            profit = result.get("profit", -decision.stake)
+            outcome = "win" if won else "loss"
+            if result.get("error"):
+                outcome = "error"
+                logger.error(f"Bet execution failed: {result['error']}")
+
+            balance_before = ai_engine.stats.current_balance
+            ai_engine.record_outcome(actual, decision)
+
+            # Override internal balance with the REAL browser balance (live mode only)
+            if real_balance_after is not None:
+                ai_engine.stats.current_balance = real_balance_after
+                ai_engine.stats.total_profit_loss = real_balance_after - ai_engine.stats.starting_balance
+                ai_engine.stats.peak_balance = max(ai_engine.stats.peak_balance, real_balance_after)
+                ai_engine.stats.lowest_balance = min(ai_engine.stats.lowest_balance, real_balance_after)
+                # Append the corrected real balance to the equity curve
+                ai_engine.stats.equity_curve.append(round(real_balance_after, 2))
+                logger.info(f"AI balance synced to real game balance: {real_balance_after} KES")
+
+            log_entry = AIBetLog(
+                action='bet',
+                stake=decision.stake,
+                target_multiplier=decision.target_multiplier,
+                actual_multiplier=actual,
+                profit_loss=profit,
+                balance_before=balance_before,
+                balance_after=ai_engine.stats.current_balance,
+                confidence=decision.confidence,
+                risk_level=decision.risk_level,
+                reasoning=decision.reasoning + (f" | Error: {result['error']}" if result.get("error") else ""),
+                analysis_snapshot=json.dumps(decision.analysis) if decision.analysis else None,
+                outcome=outcome,
+                session_id=ai_engine.stats.session_id,
+                is_dry_run=ai_engine.config.dry_run,
+            )
+            db.session.add(log_entry)
+            db.session.commit()
+
+            socketio.emit('ai_trade_result', {
+                'outcome': outcome,
+                'stake': decision.stake,
+                'target': decision.target_multiplier,
+                'actual': actual,
+                'profit_loss': round(profit, 2),
+                'balance': round(ai_engine.stats.current_balance, 2),
+                'is_dry_run': ai_engine.config.dry_run,
+            })
+            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+            if not result.get("error"):
+                # Insert the round into the DB so we accumulate history
+                source_name = 'ai_bet_executor_dry' if ai_engine.config.dry_run else 'ai_bet_executor_live'
+                round_entry = RoadWorxRound(
+                    multiplier=actual,
+                    source=source_name,
+                    game_round_id=f"ai_{int(time.time())}",
+                    session_id=ai_engine.stats.session_id
+                )
+                db.session.add(round_entry)
+                db.session.commit()
+
+                # Trigger next round decision cycle
+                def trigger_next():
+                    time.sleep(3)
+                    with app.app_context():
+                        if ai_engine and ai_engine.stats.is_running:
+                            logger.info("Triggering next AI decision cycle after bet completion.")
+                            _ai_process_round(actual)
+                threading.Thread(target=trigger_next, daemon=True).start()
+            else:
+                # If the bet execution failed with an error, trigger the next round check after a delay to keep the loop alive
+                def trigger_next_after_error():
+                    time.sleep(5)
+                    with app.app_context():
+                        if ai_engine and ai_engine.stats.is_running:
+                            logger.info("Retrying AI decision cycle after bet execution error.")
+                            _ai_process_round(1.0)
+                threading.Thread(target=trigger_next_after_error, daemon=True).start()
+
+    except Exception as e:
+        logger.error(f"Exception in run_bet_in_background: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        ai_bet_in_progress = False
+
+
+def _ai_process_round(multiplier: float):
+    """Called each time a final multiplier is captured. Drives the AI loop."""
+    global ai_engine, ai_bet_in_progress
+    if not ai_engine or not ai_engine.stats.is_running:
+        return
+
+    if ai_bet_in_progress:
+        logger.info("AI bet is currently in progress, skipping analysis for this round.")
+        return
+
+    try:
+        # Fetch recent multipliers from DB
+        recent = (
+            db.session.query(RoadWorxRound.multiplier)
+            .order_by(RoadWorxRound.timestamp.desc())
+            .limit(ai_engine.config.analysis_window)
+            .all()
+        )
+        mult_list = [r[0] for r in recent]
+
+        # Make decision
+        decision = ai_engine.make_decision(mult_list)
+
+        # Emit decision to frontend
+        socketio.emit('ai_decision', decision.to_dict())
+
+        # Record in DB
+        balance_before = ai_engine.stats.current_balance
+
+        if decision.action == 'bet':
+            # Execute bet asynchronously on the collector loop
+            if collector.is_running and hasattr(collector, 'loop') and collector.loop and collector.page:
+                bet_executor.set_page(collector.page)
+                bet_executor.dry_run = ai_engine.config.dry_run
+                
+                ai_bet_in_progress = True
+                asyncio.run_coroutine_threadsafe(run_bet_in_background(decision), collector.loop)
+                logger.info("Spawned background bet execution task.")
+            else:
+                # Fallback: collector not running or loop not initialized, simulate
+                logger.warning("Collector or event loop not running. Simulating bet outcome.")
+                actual = multiplier
+                ai_engine.record_outcome(actual, decision)
+
+                outcome = 'win' if actual >= decision.target_multiplier else 'loss'
+                profit = (decision.stake * decision.target_multiplier - decision.stake) if outcome == 'win' else -decision.stake
+
+                log_entry = AIBetLog(
+                    action='bet',
+                    stake=decision.stake,
+                    target_multiplier=decision.target_multiplier,
+                    actual_multiplier=actual,
+                    profit_loss=profit,
+                    balance_before=balance_before,
+                    balance_after=ai_engine.stats.current_balance,
+                    confidence=decision.confidence,
+                    risk_level=decision.risk_level,
+                    reasoning=decision.reasoning + " (Simulated fallback)",
+                    analysis_snapshot=json.dumps(decision.analysis) if decision.analysis else None,
+                    outcome=outcome,
+                    session_id=ai_engine.stats.session_id,
+                    is_dry_run=ai_engine.config.dry_run,
+                )
+                db.session.add(log_entry)
+                db.session.commit()
+
+                socketio.emit('ai_trade_result', {
+                    'outcome': outcome,
+                    'stake': decision.stake,
+                    'target': decision.target_multiplier,
+                    'actual': actual,
+                    'profit_loss': round(profit, 2),
+                    'balance': round(ai_engine.stats.current_balance, 2),
+                    'is_dry_run': ai_engine.config.dry_run,
+                })
+
+        elif decision.action == 'skip':
+            ai_engine.record_outcome(multiplier, decision)
+            log_entry = AIBetLog(
+                action='skip',
+                confidence=decision.confidence,
+                reasoning=decision.reasoning,
+                outcome='skipped',
+                session_id=ai_engine.stats.session_id,
+                is_dry_run=ai_engine.config.dry_run,
+                actual_multiplier=multiplier,
+                balance_before=balance_before,
+                balance_after=ai_engine.stats.current_balance,
+            )
+            db.session.add(log_entry)
+            db.session.commit()
+
+            # Since it's a single-player game, a skip would stall the loop.
+            # We schedule a new decision check after a short delay (e.g. 5 seconds)
+            def trigger_next_after_skip():
+                time.sleep(5)
+                with app.app_context():
+                    if ai_engine and ai_engine.stats.is_running:
+                        logger.info("Triggering next AI decision cycle after skip.")
+                        _ai_process_round(1.0)
+            
+            threading.Thread(target=trigger_next_after_skip, daemon=True).start()
+
+        elif decision.action == 'stop_session':
+            ai_engine.stop_session(reason=decision.reasoning)
+            log_entry = AIBetLog(
+                action='stop_session',
+                reasoning=decision.reasoning,
+                outcome='session_stopped',
+                session_id=ai_engine.stats.session_id,
+                is_dry_run=ai_engine.config.dry_run,
+                balance_before=balance_before,
+                balance_after=ai_engine.stats.current_balance,
+            )
+            db.session.add(log_entry)
+            db.session.commit()
+            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+        # Push updated stats
+        socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+    except Exception as e:
+        logger.error(f"AI process round error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.route('/api/ai/status', methods=['GET'])
+def ai_status():
+    """Get current AI engine state."""
+    if not ai_engine:
+        return jsonify({'is_running': False, 'message': 'AI engine not initialized'})
+    return jsonify({
+        'is_running': ai_engine.stats.is_running,
+        'session': ai_engine.stats.to_dict(),
+        'config': ai_engine.config.to_dict(),
+    })
+
+
+@app.route('/api/ai/start', methods=['POST'])
+def ai_start():
+    """Start an AI trading session."""
+    global ai_engine
+    if not ai_engine:
+        _init_ai_engine()
+
+    data = request.json or {}
+
+    # 1. Automatically start collection if not running
+    if not collector.is_running:
+        logger.info("Collector not running. Starting Playwright collection automatically...")
+        def run_collector():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(collector.start_collection())
+            except Exception as e:
+                logger.error(f"Collector thread error: {e}")
+
+        threading.Thread(target=run_collector, daemon=True).start()
+        
+        # Wait up to 35 seconds for the browser page to initialize
+        for _ in range(35):
+            if collector.page:
+                break
+            time.sleep(1)
+
+    # 2. Extract the actual balance from the browser page using BetExecutor
+    real_balance = None
+    if collector.page and hasattr(collector, 'loop') and collector.loop:
+        bet_executor.set_page(collector.page)
+        # Run get_current_balance thread-safely on collector's loop
+        future = asyncio.run_coroutine_threadsafe(
+            bet_executor.get_current_balance(),
+            collector.loop
+        )
+        try:
+            # Wait up to 18 seconds for balance extraction
+            real_balance = future.result(timeout=18.0)
+        except Exception as e:
+            logger.error(f"Failed to fetch real balance from UI: {e}")
+
+    # 3. Determine starting bankroll
+    starting_bankroll = float(data.get('bankroll', 100))
+    if real_balance is not None:
+        logger.info(f"Fetched real balance from game UI: {real_balance} KES")
+        starting_bankroll = real_balance
+    else:
+        logger.warning(f"Could not fetch real balance from game UI. Using pre-configured or default bankroll: {starting_bankroll} KES")
+
+    # 4. Initialize AI configuration and start the strategy session, merging optimized params
+    from ai_engine import load_optimized_params
+    opt_params = load_optimized_params()
+    
+    config_dict = {
+        'bankroll': starting_bankroll,
+        'risk_level': data.get('risk_level', 'conservative'),
+        'max_bet_pct': float(data.get('max_bet_pct', 5.0)),
+        'max_bet_abs': float(data.get('max_bet_abs', 50.0)),
+        'stop_loss_pct': float(data.get('stop_loss_pct', 30.0)),
+        'take_profit_pct': float(data.get('take_profit_pct', 50.0)),
+        'dry_run': data.get('dry_run', True),
+    }
+    
+    for key in ['kelly_fraction', 'min_data_points', 'analysis_window', 'cooldown_after_loss', 'max_consecutive_losses']:
+        if key in data:
+            config_dict[key] = data[key]
+        elif key in opt_params:
+            config_dict[key] = opt_params[key]
+            
+    # Load optimized weights & thresholds if present
+    for key, val in opt_params.items():
+        if key.startswith('w_') or key in ['confidence_threshold', 'weight_ev', 'weight_prob']:
+            config_dict[key] = val
+
+    config = AIConfig.from_dict(config_dict)
+
+    ai_engine.start_session(config)
+    bet_executor.dry_run = config.dry_run
+
+    # Share the collector's page with the executor
+    if collector.page:
+        bet_executor.set_page(collector.page)
+
+    socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+    socketio.emit('collection_status', collector.get_status())
+    
+    # Trigger first AI round check in the background so we don't block the start HTTP response
+    def trigger_initial():
+        time.sleep(1)
+        with app.app_context():
+            if ai_engine and ai_engine.stats.is_running:
+                logger.info("Triggering initial AI decision cycle.")
+                _ai_process_round(1.0)
+    threading.Thread(target=trigger_initial, daemon=True).start()
+
+    return jsonify({
+        'status': 'started',
+        'session_id': ai_engine.stats.session_id,
+        'config': config.to_dict(),
+        'collection': collector.get_status(),
+    })
+
+
+@app.route('/api/ai/stop', methods=['POST'])
+def ai_stop():
+    """Stop the AI trading session."""
+    if not ai_engine:
+        return jsonify({'status': 'not_running'})
+
+    reason = (request.json or {}).get('reason', 'user_stop')
+    ai_engine.stop_session(reason=reason)
+    
+    # Also stop the collection to close the browser cleanly
+    if collector.is_running:
+        logger.info("Stopping collector along with AI stop...")
+        collector.stop_collection()
+
+    socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+    socketio.emit('collection_status', collector.get_status())
+    
+    return jsonify({
+        'status': 'stopped',
+        'session': ai_engine.stats.to_dict(),
+        'collection': collector.get_status(),
+    })
+
+@app.route('/api/ai/config', methods=['GET', 'POST'])
+def ai_config():
+    """Get or update AI configuration."""
+    if not ai_engine:
+        _init_ai_engine()
+
+    if request.method == 'GET':
+        return jsonify(ai_engine.config.to_dict())
+
+    data = request.json or {}
+    # Update config fields
+    for key, val in data.items():
+        if hasattr(ai_engine.config, key):
+            current = getattr(ai_engine.config, key)
+            if isinstance(current, float):
+                setattr(ai_engine.config, key, float(val))
+            elif isinstance(current, int):
+                setattr(ai_engine.config, key, int(val))
+            elif isinstance(current, bool):
+                setattr(ai_engine.config, key, bool(val))
+            elif isinstance(current, str):
+                setattr(ai_engine.config, key, str(val))
+
+    return jsonify(ai_engine.config.to_dict())
+
+
+@app.route('/api/ai/decision', methods=['GET'])
+def ai_latest_decision():
+    """Get the latest AI decision without executing."""
+    if not ai_engine:
+        return jsonify({'action': 'skip', 'reasoning': 'AI engine not started'})
+
+    # Run analysis on current data
+    recent = (
+        db.session.query(RoadWorxRound.multiplier)
+        .order_by(RoadWorxRound.timestamp.desc())
+        .limit(ai_engine.config.analysis_window)
+        .all()
+    )
+    mult_list = [r[0] for r in recent]
+    decision = ai_engine.make_decision(mult_list)
+    return jsonify(decision.to_dict())
+
+
+@app.route('/api/ai/history', methods=['GET'])
+def ai_history():
+    """Get paginated AI bet log history."""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 30, type=int)
+    action_filter = request.args.get('action')  # 'bet', 'skip', etc.
+
+    query = AIBetLog.query
+    if action_filter:
+        query = query.filter_by(action=action_filter)
+
+    query = query.order_by(AIBetLog.timestamp.desc())
+    total = query.count()
+    items = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        'history': [item.to_dict() for item in items.items],
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+    })
+
+
+@app.route('/api/ai/stats', methods=['GET'])
+def ai_stats():
+    """Get AI session stats."""
+    if not ai_engine:
+        return jsonify({'is_running': False})
+    return jsonify(ai_engine.stats.to_dict())
+
+
+@app.route('/api/ai/train', methods=['POST'])
+def ai_train():
+    """Run dynamic parameter optimization on historical database rounds."""
+    global ai_engine
+    if not ai_engine:
+        _init_ai_engine()
+
+    data = request.json or {}
+    rounds_limit = int(data.get('rounds', 1000))
+    if rounds_limit < 100:
+        rounds_limit = 100
+
+    try:
+        # Fetch historical multipliers (newest first in query, reversed to oldest-first)
+        recent_rounds = (
+            RoadWorxRound.query
+            .order_by(RoadWorxRound.timestamp.desc())
+            .limit(rounds_limit)
+            .all()
+        )
+        
+        if len(recent_rounds) < 50:
+            return jsonify({
+                'error': 'Insufficient database records. Need at least 50 collected rounds to train.',
+                'data_points': len(recent_rounds)
+            }), 400
+
+        multipliers = [r.multiplier for r in reversed(recent_rounds)]
+
+        from ai_engine import optimize_parameters, save_optimized_params
+        
+        # Clone active config
+        base_config = ai_engine.config
+        
+        # Run optimization
+        result = optimize_parameters(multipliers, base_config)
+        
+        # Save optimized params
+        opt_config = result["optimized_config"]
+        opt_params = {
+            "kelly_fraction": opt_config.kelly_fraction,
+            "confidence_threshold": opt_config.confidence_threshold,
+            "cooldown_after_loss": opt_config.cooldown_after_loss,
+            "analysis_window": opt_config.analysis_window,
+            "w_prob_high": opt_config.w_prob_high,
+            "w_prob_med": opt_config.w_prob_med,
+            "w_mr_oversold": opt_config.w_mr_oversold,
+            "w_vol_low": opt_config.w_vol_low,
+            "w_streak_low": opt_config.w_streak_low,
+            "w_data_quality": opt_config.w_data_quality,
+            "w_mr_overbought": opt_config.w_mr_overbought,
+            "w_vol_high": opt_config.w_vol_high,
+            "w_streak_high": opt_config.w_streak_high,
+            "w_prob_low": opt_config.w_prob_low,
+            "w_loss_penalty": opt_config.w_loss_penalty,
+            "weight_ev": opt_config.weight_ev,
+            "weight_prob": opt_config.weight_prob
+        }
+        save_optimized_params(opt_params)
+
+        # Update active config dynamically
+        ai_engine.config = opt_config
+        socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+        return jsonify({
+            'status': 'success',
+            'data_points': len(multipliers),
+            'original_stats': result["original_stats"],
+            'optimized_stats': result["optimized_stats"],
+            'improvement_pct': result["improvement_pct"],
+            'optimized_config': opt_params
+        })
+
+    except Exception as e:
+        logger.error(f"Error during AI self-training: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/ai/analysis', methods=['GET'])
+def ai_analysis():
+    """Get the latest market analysis snapshot."""
+    if not ai_engine:
+        _init_ai_engine()
+
+    recent = (
+        db.session.query(RoadWorxRound.multiplier)
+        .order_by(RoadWorxRound.timestamp.desc())
+        .limit(ai_engine.config.analysis_window)
+        .all()
+    )
+    mult_list = [r[0] for r in recent]
+
+    if len(mult_list) < 5:
+        return jsonify({'error': 'Insufficient data', 'data_points': len(mult_list)})
+
+    analysis = ai_engine._analyse(mult_list)
+    return jsonify(analysis)
+
+
+@app.route('/api/ai/history/clear', methods=['POST'])
+def ai_clear_history():
+    """Clear AI bet log history."""
+    try:
+        num_deleted = AIBetLog.query.delete()
+        db.session.commit()
+        return jsonify({'status': 'success', 'deleted': num_deleted})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+# ===================================================================
+# ERROR HANDLERS
+# ===================================================================
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'error': 'Not found'}), 404
@@ -693,6 +1365,7 @@ if __name__ == '__main__':
     # Initialize DB
     with app.app_context():
         migrate_db()
+        _init_ai_engine()
     
     # Check if we are running in production mode
     is_prod = os.environ.get('FLASK_ENV') == 'production'

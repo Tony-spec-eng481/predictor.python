@@ -9,7 +9,7 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
-class PlaywrightAviatorCollector:
+class PlaywrightRoadWorxCollector:
     def __init__(self, api_url="http://localhost:5000/api/multiplier"):
         self.api_url = api_url
         self.is_running = False
@@ -33,6 +33,7 @@ class PlaywrightAviatorCollector:
         if self.is_running:
             return
         
+        self.loop = asyncio.get_running_loop()
         self.is_running = True
         await self._run_browser()
 
@@ -51,9 +52,21 @@ class PlaywrightAviatorCollector:
                 
                 self.page.on("websocket", self._handle_websocket)
                 
-                url = "https://www.ke.sportpesa.com/en/casino/aviator"
+                url = "https://splitthepot.games/sportpesa-ke/bomber/crossing?token=freetoplay&lobby_URL=https:%2F%2Fwww.ke.sportpesa.com%2Fcasino"
                 await self.page.goto(url)
                 
+                logger.info("Playwright browser started. Checking for onboarding modals...")
+                # Dismiss onboarding modal if present
+                for selector in ['button:has-text("Close")', 'button:has-text("Next")']:
+                    try:
+                        elem = await self.page.wait_for_selector(selector, timeout=8000)
+                        if elem:
+                            logger.info(f"Onboarding modal detected. Clicking button: {selector}")
+                            await elem.click()
+                            await asyncio.sleep(1)
+                    except Exception as e:
+                        pass
+
                 logger.info("Playwright browser started. Navigate and login as needed.")
                 
                 while self.is_running:
@@ -83,6 +96,8 @@ class PlaywrightAviatorCollector:
                     payload = frame.decode('utf-8', errors='ignore')
                 except:
                     payload = ""
+            
+            logger.info(f"WS Frame (binary={is_binary}): {payload[:200]}")
             
             # Check for keywords
             keywords = ["crash", "multiplier", "val", "maxMultiplier"]
@@ -160,7 +175,7 @@ class PlaywrightAviatorCollector:
         return None
 
     def _process_json_data(self, data):
-        """Specifically look for Aviator/Spribe patterns in JSON objects."""
+        """Specifically look for Road Worx/Bomber patterns in JSON objects."""
         msg_type = data.get('type')
         msg_data = data.get('data')
 

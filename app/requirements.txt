@@ -21,3 +21,4 @@ schedule==1.2.2
 
 # SQLAlchemy extras (for Postgres support if needed)
 # psycopg2-binary==2.9.9
+requests

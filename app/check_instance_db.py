@@ -9,8 +9,8 @@ if os.path.exists(db_path):
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = cursor.fetchall()
         print(f"Tables: {tables}")
-        if ('aviator_round',) in tables:
-            cursor.execute("SELECT * FROM aviator_round ORDER BY timestamp DESC LIMIT 10;")
+        if ('road_worx_round',) in tables:
+            cursor.execute("SELECT * FROM road_worx_round ORDER BY timestamp DESC LIMIT 10;")
             rows = cursor.fetchall()
             print(f"Found {len(rows)} rounds.")
             for row in rows:

@@ -1,7 +1,7 @@
 """
-Aviator Provably Fair Verification Module
+Road Worx Provably Fair Verification Module
 
-The Aviator game by Spribe uses a provably fair system:
+The Road Worx game by Spribe uses a provably fair system:
   1. Server generates a server_seed (committed via SHA-256 hash before the round)
   2. First 3 players' browsers provide client_seeds
   3. Combined string:  server_seed:client_seed_1:client_seed_2:client_seed_3:nonce
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 def compute_crash_point(server_seed: str, combined_client_seed: str, nonce: int | None = None) -> float:
     """
-    Reproduce the Aviator crash point from seeds.
+    Reproduce the Road Worx crash point from seeds.
 
     Args:
         server_seed: The server-generated seed (revealed after round ends)
