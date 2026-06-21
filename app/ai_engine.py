@@ -217,9 +217,12 @@ class AIStrategyEngine:
         if len(multipliers) < self.config.min_data_points:
             if self.stats.current_balance >= 10:
                 logger.info(f"Insufficient data ({len(multipliers)}/{self.config.min_data_points} rounds). Placing a bootstrap exploration bet.")
+                bootstrap_stake = self.stats.current_balance * 0.10
+                bootstrap_stake = max(10.0, bootstrap_stake)
+                bootstrap_stake = min(bootstrap_stake, self.stats.current_balance)
                 return AIDecision(
                     action="bet",
-                    stake=10.0,
+                    stake=round(bootstrap_stake, 2),
                     target_multiplier=1.20,
                     confidence=50.0,
                     reasoning=f"Bootstrapping data collection ({len(multipliers)}/{self.config.min_data_points} rounds)",
@@ -550,60 +553,13 @@ class AIStrategyEngine:
 
     def _calculate_stake(self, target: float, win_prob: float, analysis: dict) -> float:
         """
-        Use fractional Kelly Criterion to calculate optimal stake.
-        f* = (bp - q) / b   where b = target-1, p = win_prob, q = 1-p
-        Then apply fraction and caps.
-        If Kelly Criterion is <= 0 (negative/zero edge), fall back to a small
-        risk-adjusted flat size so the AI can actually play.
+        Calculates stake as exactly 10 percent of the current balance.
         """
-        b = target - 1.0  # net odds
-        p = win_prob
-        q = 1 - p
-
-        if b <= 0 or p <= 0:
-            return 0
-
-        kelly = (b * p - q) / b
-        
-        if kelly <= 0:
-            # Fallback flat size based on risk level
-            risk_pct = {"conservative": 1.0, "moderate": 2.0, "aggressive": 5.0}
-            flat_pct = risk_pct.get(self.config.risk_level, 1.0)
-            stake_pct = min(flat_pct, self.config.max_bet_pct)
-        else:
-            # Apply fractional Kelly
-            stake_pct = kelly * self.config.kelly_fraction * 100
-
-        # AI decides to increase/decrease the stake based on streak and volatility:
-        # 1. Winning streak boost: scale up stake on a winning streak (minimum 2 consecutive wins)
-        if self.stats.current_streak >= 2:
-            # Scale up by +15% per consecutive win past the first one, capped at +60% max boost
-            scale_up = 1.0 + min(0.60, (self.stats.current_streak - 1) * 0.15)
-            stake_pct *= scale_up
-
-        # 2. Reducing streak scale-down: Halve the stake after consecutive losses
-        if self.stats.consecutive_losses > 0:
-            reduction = 0.5 ** self.stats.consecutive_losses  # halve each loss
-            stake_pct *= reduction
-
-        # 3. Market Volatility check: Scale down stake on high volatility
-        vol = analysis.get("volatility_10", 0)
-        stdev = analysis.get("stdev", 1.0)
-        if vol > stdev * 1.3:
-            # Erratic market: reduce stake size by 25% for safety
-            stake_pct *= 0.75
-
-        # Cap at max bet percentage
-        stake_pct = min(stake_pct, self.config.max_bet_pct)
-
-        # Calculate absolute stake
-        stake = self.stats.current_balance * (stake_pct / 100)
-
-        # Apply absolute cap
-        stake = min(stake, self.config.max_bet_abs)
+        stake = self.stats.current_balance * 0.10
 
         # Minimum bet (platform minimum is usually 10 KES)
-        stake = max(10.0, stake) if stake > 0 else 0
+        if stake > 0:
+            stake = max(10.0, stake)
 
         # Don't bet more than balance
         stake = min(stake, self.stats.current_balance)

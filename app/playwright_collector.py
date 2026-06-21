@@ -40,10 +40,20 @@ class PlaywrightRoadWorxCollector:
     async def _run_browser(self):
         async with async_playwright() as p:
             try:
+                # Dynamic headless mode detection (default True in production, False in development)
+                env_headless = os.environ.get("PLAYWRIGHT_HEADLESS")
+                if env_headless is not None:
+                    headless_mode = env_headless.lower() == "true"
+                else:
+                    flask_env = os.environ.get("FLASK_ENV", "development").lower()
+                    headless_mode = (flask_env == "production")
+
+                logger.info(f"Launching Playwright Chromium (headless={headless_mode})")
+
                 # Use persistent context to save login state
                 self.context = await p.chromium.launch_persistent_context(
                     user_data_dir=self.user_data_dir,
-                    headless=False,
+                    headless=headless_mode,
                     args=["--disable-blink-features=AutomationControlled"]
                 )
                 

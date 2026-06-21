@@ -20,4 +20,4 @@ with app.app_context():
     migrate_db()
 
 # gevent-websocket compatible WSGI application
-application = socketio.middleware(app)
+application = app

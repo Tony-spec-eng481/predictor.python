@@ -172,16 +172,43 @@ class BetExecutor:
     # ------------------------------------------------------------------
 
     async def _find_element(self, selector_group: str, timeout: int = 5000):
-        """Try multiple selectors until one matches."""
+        """Try multiple selectors in parallel to avoid sequential timeout bottlenecks."""
         selectors = self.SELECTORS.get(selector_group, [])
+        
+        # 1. Quick check: check if any selector is already visible (very small timeout)
         for sel in selectors:
             try:
-                elem = await self.page.wait_for_selector(sel, timeout=timeout, state="visible")
+                elem = await self.page.wait_for_selector(sel, timeout=10, state="visible")
                 if elem:
-                    logger.debug(f"Found {selector_group} with selector: {sel}")
+                    logger.debug(f"Found {selector_group} immediately with selector: {sel}")
                     return elem
             except:
-                continue
+                pass
+
+        # 2. Parallel wait for any selector to become visible
+        async def wait_single(sel):
+            try:
+                return await self.page.wait_for_selector(sel, timeout=timeout, state="visible")
+            except:
+                return None
+
+        if selectors and timeout > 50:
+            tasks = [asyncio.create_task(wait_single(sel)) for sel in selectors]
+            try:
+                for future in asyncio.as_completed(tasks, timeout=timeout/1000.0 + 1.0):
+                    elem = await future
+                    if elem:
+                        # Cancel remaining tasks
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        return elem
+            except Exception as e:
+                logger.debug(f"Error during parallel selector wait: {e}")
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+
         return None
 
     async def _wait_for_bet_phase(self, max_wait: int = 60):

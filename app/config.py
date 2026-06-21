@@ -21,10 +21,11 @@ class BaseConfig:
     CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
 
     # SQLite DB path (can be overridden by DATABASE_URL for Postgres, etc.)
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        'DATABASE_URL',
-        f"sqlite:///{os.path.join(BASE_DIR, 'instance', 'database.db')}"
-    )
+    # Render's database URL starts with postgres://, which needs to be replaced with postgresql:// for SQLAlchemy
+    _db_url = os.environ.get('DATABASE_URL')
+    if _db_url and _db_url.startswith("postgres://"):
+        _db_url = _db_url.replace("postgres://", "postgresql://", 1)
+    SQLALCHEMY_DATABASE_URI = _db_url or f"sqlite:///{os.path.join(BASE_DIR, 'instance', 'database.db')}"
 
     # Logging
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')

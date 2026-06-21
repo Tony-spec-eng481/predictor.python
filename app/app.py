@@ -59,7 +59,9 @@ socketio = SocketIO(
 )
 
 # Use configured internal API URL for collector if provided
-internal_api = f"http://{cfg.HOST}:{cfg.PORT}/api/multiplier"
+# If the host is 0.0.0.0 (all interfaces), use 127.0.0.1 for local loopback API requests
+host_ip = "127.0.0.1" if cfg.HOST == "0.0.0.0" else cfg.HOST
+internal_api = f"http://{host_ip}:{cfg.PORT}/api/multiplier"
 collector = PlaywrightRoadWorxCollector(api_url=internal_api)
 
 # --- AI Engine & Executor ---
