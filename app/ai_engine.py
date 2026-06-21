@@ -40,7 +40,7 @@ class AIConfig:
     dry_run: bool = True                  # If True, log decisions but don't execute
     target_win_rate: float = 0.65         # Aim for this win probability
     preferred_targets: List[float] = field(
-        default_factory=lambda: [1.25, 1.30, 1.50, 1.80, 2.00]
+        default_factory=lambda: [1.25, 1.30, 1.50, 1.80, 1.95]
     )
 
     # Dynamic/Tunable weights and thresholds for evaluation
@@ -170,12 +170,13 @@ class AIStrategyEngine:
     betting decisions each round.
     """
 
-    def __init__(self, db_session_factory, config: Optional[AIConfig] = None):
+    def __init__(self, db_session_factory, config: Optional[AIConfig] = None, shared_cache: Optional[dict] = None):
         self.db = db_session_factory
         self.config = config or AIConfig()
         self.stats = SessionStats()
         self._last_decision: Optional[AIDecision] = None
         self._analysis_cache: dict = {}
+        self.shared_cache = shared_cache if shared_cache is not None else {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -314,7 +315,12 @@ class AIStrategyEngine:
 
     def _analyse(self, multipliers: List[float]) -> dict:
         """Run full statistical analysis on the multiplier history."""
-        window = multipliers[: self.config.analysis_window]
+        # Convert window to tuple to use as cache key
+        window_tuple = tuple(multipliers[:self.config.analysis_window])
+        if window_tuple in self.shared_cache:
+            return self.shared_cache[window_tuple]
+
+        window = list(window_tuple)
         n = len(window)
 
         mean = statistics.mean(window)
@@ -353,7 +359,7 @@ class AIStrategyEngine:
 
         # Probability of reaching specific multipliers
         prob_targets = {}
-        for t in [1.20, 1.25, 1.30, 1.50, 1.80, 2.00, 3.00, 5.00]:
+        for t in [1.20, 1.25, 1.30, 1.50, 1.80, 1.95, 2.00, 3.00, 5.00]:
             hits = sum(1 for m in window if m >= t)
             prob_targets[f"{t}x"] = round(hits / n, 4)
 
@@ -372,7 +378,7 @@ class AIStrategyEngine:
         if stdev > 0 and n > 2:
             skewness = sum((m - mean) ** 3 for m in window) / (n * stdev ** 3)
 
-        return {
+        result = {
             "data_points": n,
             "mean": round(mean, 3),
             "median": round(median, 3),
@@ -391,6 +397,8 @@ class AIStrategyEngine:
             "mean_reversion": mr_signal,
             "last_5": [round(m, 2) for m in r5],
         }
+        self.shared_cache[window_tuple] = result
+        return result
 
     def _calc_streaks(self, multipliers: List[float]) -> dict:
         """Analyse low/high streaks in the data."""
@@ -469,34 +477,71 @@ class AIStrategyEngine:
     def _select_target(self, analysis: dict) -> tuple:
         """
         Pick the optimal cashout target based on probability analysis
-        and the configured risk level.
+        and the configured risk level, dynamically adjusting it based on performance.
         """
         probs = analysis["probabilities"]
         mr = analysis["mean_reversion"]
+        vol = analysis.get("volatility_10", 0)
+        stdev = analysis.get("stdev", 1.0)
 
         best_target = 1.50
         best_ev = -999.0
 
         for target in self.config.preferred_targets:
+            # Cap preferred targets at 1.95 max
+            target = min(target, 1.95)
             key = f"{target}x"
             prob = probs.get(key, 0)
-            # Expected value = prob * (target - 1) - (1 - prob)
             ev = prob * (target - 1) - (1 - prob)
-            # Score target ev using optimized weights
             score = ev * self.config.weight_ev + prob * self.config.weight_prob
 
             if score > best_ev:
                 best_ev = score
                 best_target = target
 
-        # Mean reversion adjustment
-        if mr["signal"] == "oversold" and mr["strength"] > 40:
-            # Market is "due" for recovery — can aim slightly higher
-            idx = self.config.preferred_targets.index(best_target) if best_target in self.config.preferred_targets else 0
-            if idx < len(self.config.preferred_targets) - 1:
-                best_target = self.config.preferred_targets[idx + 1]
+        # Dynamic Adjustment: AI decides target scaling based on streak and volatility
+        # 1. Win streak scaling: Increase target on positive momentum
+        if self.stats.current_streak > 0:
+            # Scale target up by +0.05 per win, up to a maximum of 1.95x
+            best_target = min(1.95, best_target + (self.stats.current_streak * 0.05))
+            
+        # 2. Loss streak scaling: Decrease target to increase safety
+        elif self.stats.consecutive_losses > 0:
+            # Scale target down by -0.05 per consecutive loss, down to a minimum of 1.20x
+            best_target = max(1.20, best_target - (self.stats.consecutive_losses * 0.05))
 
-        target_prob = probs.get(f"{best_target}x", 0.5)
+        # 3. Mean reversion scaling
+        if mr["signal"] == "oversold" and mr["strength"] > 40:
+            best_target = min(1.95, best_target + 0.1)
+        elif mr["signal"] == "overbought" and mr["strength"] > 40:
+            best_target = max(1.20, best_target - 0.1)
+
+        # 4. Volatility scaling
+        if vol > stdev * 1.3:
+            # Lower target under high volatility
+            best_target = max(1.20, best_target - 0.1)
+        elif vol < stdev * 0.7:
+            # Raise target under low volatility
+            best_target = min(1.95, best_target + 0.05)
+
+        # Final rounding and clamping (Max 1.95x target absolute cap)
+        best_target = round(best_target, 2)
+        best_target = max(1.20, min(1.95, best_target))
+
+        # Retrieve target probability
+        prob_key = f"{best_target}x"
+        if prob_key in probs:
+            target_prob = probs[prob_key]
+        else:
+            # Interpolation/fallback if target is rounded/adjusted
+            keys = [float(k.replace('x', '')) for k in probs.keys() if 'x' in k]
+            keys.sort()
+            if not keys:
+                target_prob = 0.5
+            else:
+                closest_key = min(keys, key=lambda x: abs(x - best_target))
+                target_prob = probs.get(f"{closest_key}x", 0.5)
+
         return best_target, target_prob
 
     # ------------------------------------------------------------------
@@ -529,10 +574,24 @@ class AIStrategyEngine:
             # Apply fractional Kelly
             stake_pct = kelly * self.config.kelly_fraction * 100
 
-        # Reduce stake after consecutive losses
+        # AI decides to increase/decrease the stake based on streak and volatility:
+        # 1. Winning streak boost: scale up stake on a winning streak (minimum 2 consecutive wins)
+        if self.stats.current_streak >= 2:
+            # Scale up by +15% per consecutive win past the first one, capped at +60% max boost
+            scale_up = 1.0 + min(0.60, (self.stats.current_streak - 1) * 0.15)
+            stake_pct *= scale_up
+
+        # 2. Reducing streak scale-down: Halve the stake after consecutive losses
         if self.stats.consecutive_losses > 0:
             reduction = 0.5 ** self.stats.consecutive_losses  # halve each loss
             stake_pct *= reduction
+
+        # 3. Market Volatility check: Scale down stake on high volatility
+        vol = analysis.get("volatility_10", 0)
+        stdev = analysis.get("stdev", 1.0)
+        if vol > stdev * 1.3:
+            # Erratic market: reduce stake size by 25% for safety
+            stake_pct *= 0.75
 
         # Cap at max bet percentage
         stake_pct = min(stake_pct, self.config.max_bet_pct)
@@ -718,12 +777,12 @@ class AIStrategyEngine:
 # Backtesting & Dynamic Optimization
 # ---------------------------------------------------------------------------
 
-def backtest_simulation(config: AIConfig, multipliers: List[float]) -> dict:
+def backtest_simulation(config: AIConfig, multipliers: List[float], shared_cache: Optional[dict] = None) -> dict:
     """
     Simulates AIStrategyEngine over historical multipliers.
     multipliers: List of float, oldest round first (index 0 is oldest, index -1 is newest).
     """
-    engine = AIStrategyEngine(db_session_factory=None, config=config)
+    engine = AIStrategyEngine(db_session_factory=None, config=config, shared_cache=shared_cache)
     engine.stats = SessionStats(
         session_id="backtest",
         started_at=datetime.utcnow().isoformat(),
@@ -794,81 +853,143 @@ def backtest_simulation(config: AIConfig, multipliers: List[float]) -> dict:
 
 def optimize_parameters(multipliers: List[float], base_config: AIConfig) -> dict:
     """
-    Finds the optimal configuration parameters for AIStrategyEngine by backtesting.
+    Finds the optimal configuration parameters for AIStrategyEngine by using
+    a Genetic Algorithm (Evolutionary Search) to optimize weights and thresholds.
     """
-    # Define hyperparameter options to search
-    kelly_options = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40]
-    confidence_thresholds = [40.0, 45.0, 50.0, 55.0, 60.0]
-    cooldown_options = [1, 2, 3]
-    window_options = [50, 75, 100]
+    import random
+    shared_cache = {}
 
-    # Evaluate the baseline first
-    baseline_stats = backtest_simulation(base_config, multipliers)
-    
-    best_config = base_config
-    best_stats = baseline_stats
-    
-    # We want to maximize profit while minimizing drawdown
-    best_score = best_stats["profit_loss"] - (0.5 * best_stats["drawdown"])
-    if best_stats["ruined"]:
-        best_score = -99999.0
+    def clamp(val, min_val, max_val):
+        return max(min_val, min(max_val, val))
 
-    import itertools
-    combinations = list(itertools.product(
-        kelly_options, confidence_thresholds, cooldown_options, window_options
-    ))
+    def mutate_param(val, bounds, step, is_int=False):
+        if random.random() > 0.3:  # 30% chance to mutate
+            return val
+        if is_int:
+            drift = random.choice([-step, 0, step])
+            return clamp(int(val + drift), bounds[0], bounds[1])
+        else:
+            drift = random.uniform(-step, step)
+            return clamp(val + drift, bounds[0], bounds[1])
 
-    for kelly, threshold, cooldown, window in combinations:
-        # Clone base config with new test parameters
-        test_config = AIConfig(
-            bankroll=base_config.bankroll,
-            risk_level=base_config.risk_level,
-            max_bet_pct=base_config.max_bet_pct,
-            max_bet_abs=base_config.max_bet_abs,
-            stop_loss_pct=base_config.stop_loss_pct,
-            take_profit_pct=base_config.take_profit_pct,
-            kelly_fraction=kelly,
-            confidence_threshold=threshold,
-            cooldown_after_loss=cooldown,
-            analysis_window=window,
-            min_data_points=base_config.min_data_points,
-            max_consecutive_losses=base_config.max_consecutive_losses,
-            dry_run=base_config.dry_run,
-            preferred_targets=base_config.preferred_targets,
-            w_prob_high=base_config.w_prob_high,
-            w_prob_med=base_config.w_prob_med,
-            w_mr_oversold=base_config.w_mr_oversold,
-            w_vol_low=base_config.w_vol_low,
-            w_streak_low=base_config.w_streak_low,
-            w_data_quality=base_config.w_data_quality,
-            w_mr_overbought=base_config.w_mr_overbought,
-            w_vol_high=base_config.w_vol_high,
-            w_streak_high=base_config.w_streak_high,
-            w_prob_low=base_config.w_prob_low,
-            w_loss_penalty=base_config.w_loss_penalty,
-            weight_ev=base_config.weight_ev,
-            weight_prob=base_config.weight_prob
+    def mutate(cfg: AIConfig) -> AIConfig:
+        new_cfg = AIConfig(
+            bankroll=cfg.bankroll,
+            risk_level=cfg.risk_level,
+            max_bet_pct=cfg.max_bet_pct,
+            max_bet_abs=cfg.max_bet_abs,
+            stop_loss_pct=cfg.stop_loss_pct,
+            take_profit_pct=cfg.take_profit_pct,
+            dry_run=cfg.dry_run,
+            preferred_targets=cfg.preferred_targets,
+            kelly_fraction=mutate_param(cfg.kelly_fraction, (0.05, 0.45), 0.05),
+            confidence_threshold=mutate_param(cfg.confidence_threshold, (35.0, 70.0), 5.0),
+            cooldown_after_loss=mutate_param(cfg.cooldown_after_loss, (1, 4), 1, is_int=True),
+            analysis_window=mutate_param(cfg.analysis_window, (40, 120), 10, is_int=True),
+            min_data_points=cfg.min_data_points,
+            max_consecutive_losses=cfg.max_consecutive_losses,
+            w_prob_high=mutate_param(cfg.w_prob_high, (0.0, 30.0), 3.0),
+            w_prob_med=mutate_param(cfg.w_prob_med, (0.0, 20.0), 2.0),
+            w_mr_oversold=mutate_param(cfg.w_mr_oversold, (0.0, 30.0), 3.0),
+            w_vol_low=mutate_param(cfg.w_vol_low, (0.0, 20.0), 2.0),
+            w_streak_low=mutate_param(cfg.w_streak_low, (0.0, 20.0), 2.0),
+            w_data_quality=mutate_param(cfg.w_data_quality, (0.0, 15.0), 1.5),
+            w_mr_overbought=mutate_param(cfg.w_mr_overbought, (0.0, 30.0), 3.0),
+            w_vol_high=mutate_param(cfg.w_vol_high, (0.0, 30.0), 3.0),
+            w_streak_high=mutate_param(cfg.w_streak_high, (0.0, 20.0), 2.0),
+            w_prob_low=mutate_param(cfg.w_prob_low, (0.0, 30.0), 3.0),
+            w_loss_penalty=mutate_param(cfg.w_loss_penalty, (0.0, 20.0), 2.0),
+            weight_ev=mutate_param(cfg.weight_ev, (0.1, 0.9), 0.1),
+            weight_prob=0.0
         )
+        new_cfg.weight_prob = round(1.0 - new_cfg.weight_ev, 2)
+        new_cfg.min_data_points = min(cfg.min_data_points, new_cfg.analysis_window)
+        return new_cfg
 
-        stats = backtest_simulation(test_config, multipliers)
-        
-        # Scoring
-        score = stats["profit_loss"] - (0.5 * stats["drawdown"])
-        if stats["ruined"]:
-            score = -99999.0
-            
-        # Small penalty if too few bets
-        if stats["total_bets"] < 5:
-            score -= 50.0
+    def crossover(parent1: AIConfig, parent2: AIConfig) -> AIConfig:
+        child_params = {}
+        for field in parent1.__dataclass_fields__:
+            if field in ['bankroll', 'risk_level', 'max_bet_pct', 'max_bet_abs', 'stop_loss_pct', 'take_profit_pct', 'dry_run', 'preferred_targets', 'min_data_points', 'max_consecutive_losses']:
+                child_params[field] = getattr(parent1, field)
+            elif field == 'weight_prob':
+                continue
+            else:
+                child_params[field] = getattr(parent1 if random.random() > 0.5 else parent2, field)
+        child = AIConfig(**child_params)
+        child.weight_prob = round(1.0 - child.weight_ev, 2)
+        child.min_data_points = min(parent1.min_data_points, child.analysis_window)
+        return child
 
-        if score > best_score:
-            best_score = score
-            best_config = test_config
-            best_stats = stats
+    # Evaluate baseline
+    baseline_stats = backtest_simulation(base_config, multipliers, shared_cache)
+
+    # Genetic Algorithm Parameters
+    pop_size = 30
+    generations = 15
+    elite_size = 6
+
+    # Seed population
+    population = [base_config]
+    for _ in range(pop_size - 1):
+        population.append(mutate(base_config))
+
+    best_overall_config = base_config
+    best_overall_stats = baseline_stats
+    best_overall_score = baseline_stats["profit_loss"] - (0.5 * baseline_stats["drawdown"])
+    if baseline_stats["ruined"]:
+        best_overall_score = -99999.0
+
+    for gen in range(generations):
+        evaluated_pop = []
+        for ind in population:
+            stats = backtest_simulation(ind, multipliers, shared_cache)
+            score = stats["profit_loss"] - (0.5 * stats["drawdown"])
+            if stats["ruined"]:
+                score = -99999.0
+            if stats["total_bets"] < 5:
+                score -= 50.0
+            evaluated_pop.append((ind, stats, score))
+
+        # Sort
+        evaluated_pop.sort(key=lambda x: x[2], reverse=True)
+
+        # Update best overall
+        current_best_ind, current_best_stats, current_best_score = evaluated_pop[0]
+        if current_best_score > best_overall_score:
+            best_overall_score = current_best_score
+            best_overall_config = current_best_ind
+            best_overall_stats = current_best_stats
+
+        # Keep elites
+        new_population = []
+        for i in range(elite_size):
+            new_population.append(evaluated_pop[i][0])
+
+        # Fill rest of population
+        while len(new_population) < pop_size:
+            tournament = random.sample(evaluated_pop[:15], 3)
+            tournament.sort(key=lambda x: x[2], reverse=True)
+            parent1 = tournament[0][0]
+
+            tournament2 = random.sample(evaluated_pop[:15], 3)
+            tournament2.sort(key=lambda x: x[2], reverse=True)
+            parent2 = tournament2[0][0]
+
+            child = crossover(parent1, parent2)
+            child = mutate(child)
+            new_population.append(child)
+
+        population = new_population
+
+    improvement_pct = 0.0
+    if abs(baseline_stats["profit_loss"]) > 0:
+        improvement_pct = round(((best_overall_stats["profit_loss"] - baseline_stats["profit_loss"]) / abs(baseline_stats["profit_loss"])) * 100, 1)
+    else:
+        improvement_pct = round(best_overall_stats["profit_loss"] * 100, 1)
 
     return {
         "original_stats": baseline_stats,
-        "optimized_stats": best_stats,
-        "optimized_config": best_config,
-        "improvement_pct": round(((best_stats["profit_loss"] - baseline_stats["profit_loss"]) / max(1.0, abs(baseline_stats["profit_loss"]))) * 100, 1)
+        "optimized_stats": best_overall_stats,
+        "optimized_config": best_overall_config,
+        "improvement_pct": improvement_pct
     }

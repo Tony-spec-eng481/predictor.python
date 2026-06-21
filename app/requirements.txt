@@ -6,8 +6,8 @@ Flask-SocketIO==5.3.6
 
 # Async / WebSocket support
 python-socketio>=5.12.0
-gevent==24.11.1
-gevent-websocket==0.10.1
+# gevent==24.11.1 (Not supported on Python 3.14 yet)
+# gevent-websocket==0.10.1 (Not supported on Python 3.14 yet)
 
 # Production WSGI server (Gunicorn + gevent worker)
 gunicorn==22.0.0

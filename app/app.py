@@ -1,5 +1,9 @@
-import gevent.monkey
-gevent.monkey.patch_all()
+try:
+    import gevent.monkey
+    gevent.monkey.patch_all()
+    HAS_GEVENT = True
+except ImportError:
+    HAS_GEVENT = False
 
 import os
 import threading
@@ -44,10 +48,12 @@ app.config.from_object(cfg)
 db.init_app(app)
 CORS(app, resources={r"/api/*": {"origins": cfg.CORS_ORIGINS}})
 
+async_mode = cfg.SOCKETIO_ASYNC_MODE if HAS_GEVENT else 'threading'
 socketio = SocketIO(
     app, 
     cors_allowed_origins=cfg.CORS_ORIGINS, 
-    async_mode=cfg.SOCKETIO_ASYNC_MODE,
+    async_mode=async_mode,
+    websocket=HAS_GEVENT,
     logger=False, 
     engineio_logger=False
 )
@@ -62,6 +68,10 @@ bet_executor = BetExecutor(dry_run=True)
 ai_session_thread = None
 ai_stop_event = threading.Event()
 ai_bet_in_progress = False
+last_trained_db_count = 0
+is_bg_training = False
+bg_training_lock = threading.Lock()
+last_training_result = None
 
 def _push_multiplier(data):
     with app.app_context():
@@ -101,6 +111,14 @@ collector.on_multiplier = _push_multiplier
 
 def migrate_db():
     with app.app_context():
+        # Ensure database parent directory exists for SQLite
+        db_uri = app.config.get('SQLALCHEMY_DATABASE_URI')
+        if db_uri and db_uri.startswith('sqlite:///'):
+            db_path = db_uri.replace('sqlite:///', '')
+            db_dir = os.path.dirname(os.path.abspath(db_path))
+            os.makedirs(db_dir, exist_ok=True)
+            logger.info(f"Ensured database directory exists: {db_dir}")
+
         db.create_all()
         inspector = inspect(db.engine)
         existing = [c['name'] for c in inspector.get_columns('road_worx_round')]
@@ -205,6 +223,8 @@ def add_multiplier():
     # Trigger AI process round if AI is running
     if ai_engine and ai_engine.stats.is_running:
         _ai_process_round(multiplier)
+    else:
+        _check_automated_training()
         
     return jsonify(payload)
 
@@ -765,7 +785,7 @@ def stop_collection():
 
 def _init_ai_engine():
     """Initialize the AI engine with a DB session factory, loading optimized defaults."""
-    global ai_engine
+    global ai_engine, last_trained_db_count
     from ai_engine import load_optimized_params
     opt_params = load_optimized_params()
     
@@ -783,6 +803,13 @@ def _init_ai_engine():
         config=AIConfig.from_dict(config_dict),
     )
     logger.info("AI Strategy Engine initialized with optimized defaults")
+    
+    try:
+        last_trained_db_count = RoadWorxRound.query.count()
+        logger.info(f"Initialized last_trained_db_count on startup to: {last_trained_db_count}")
+    except Exception as e:
+        logger.warning(f"Could not initialize last_trained_db_count on startup: {e}")
+        last_trained_db_count = 0
 
 
 async def run_bet_in_background(decision):
@@ -891,6 +918,116 @@ async def run_bet_in_background(decision):
         traceback.print_exc()
     finally:
         ai_bet_in_progress = False
+
+
+def run_bg_training_job():
+    global ai_engine, is_bg_training, last_training_result
+    try:
+        with app.app_context():
+            logger.info("Background self-training started...")
+            socketio.emit('ai_training_started', {'status': 'training'})
+            
+            # Use 1000 rounds for background training
+            rounds_limit = 1000
+            recent_rounds = (
+                RoadWorxRound.query
+                .order_by(RoadWorxRound.timestamp.desc())
+                .limit(rounds_limit)
+                .all()
+            )
+            
+            if len(recent_rounds) < 50:
+                logger.warning(f"Skipping background training: only {len(recent_rounds)} rounds in DB.")
+                return
+
+            multipliers = [r.multiplier for r in reversed(recent_rounds)]
+            
+            from ai_engine import optimize_parameters, save_optimized_params
+            
+            # Clone active config
+            base_config = ai_engine.config
+            
+            # Run evolutionary optimization
+            result = optimize_parameters(multipliers, base_config)
+            
+            # Save optimized params
+            opt_config = result["optimized_config"]
+            opt_params = {
+                "kelly_fraction": opt_config.kelly_fraction,
+                "confidence_threshold": opt_config.confidence_threshold,
+                "cooldown_after_loss": opt_config.cooldown_after_loss,
+                "analysis_window": opt_config.analysis_window,
+                "w_prob_high": opt_config.w_prob_high,
+                "w_prob_med": opt_config.w_prob_med,
+                "w_mr_oversold": opt_config.w_mr_oversold,
+                "w_vol_low": opt_config.w_vol_low,
+                "w_streak_low": opt_config.w_streak_low,
+                "w_data_quality": opt_config.w_data_quality,
+                "w_mr_overbought": opt_config.w_mr_overbought,
+                "w_vol_high": opt_config.w_vol_high,
+                "w_streak_high": opt_config.w_streak_high,
+                "w_prob_low": opt_config.w_prob_low,
+                "w_loss_penalty": opt_config.w_loss_penalty,
+                "weight_ev": opt_config.weight_ev,
+                "weight_prob": opt_config.weight_prob
+            }
+            save_optimized_params(opt_params)
+            
+            # Update active config dynamically
+            ai_engine.config = opt_config
+            
+            # Store the last training result
+            last_training_result = {
+                'data_points': len(multipliers),
+                'original_stats': result["original_stats"],
+                'optimized_stats': result["optimized_stats"],
+                'improvement_pct': result["improvement_pct"],
+                'optimized_config': opt_params
+            }
+            
+            # Broadcast the new stats and notification of completed training
+            socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+            socketio.emit('ai_training_completed', {
+                'status': 'success',
+                'data_points': len(multipliers),
+                'original_stats': result["original_stats"],
+                'optimized_stats': result["optimized_stats"],
+                'improvement_pct': result["improvement_pct"],
+                'optimized_config': opt_params
+            })
+            
+            logger.info(f"Background self-training completed successfully! P/L Lift: {result['improvement_pct']}%")
+            
+    except Exception as e:
+        logger.error(f"Error during background self-training: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        with bg_training_lock:
+            is_bg_training = False
+
+
+def _check_automated_training():
+    global last_trained_db_count, is_bg_training
+    if not ai_engine:
+        return
+        
+    try:
+        current_count = RoadWorxRound.query.count()
+    except Exception as e:
+        logger.error(f"Failed to count rounds for training check: {e}")
+        return
+
+    # Trigger training if we have at least 100 new rounds since last training and we have enough total rounds to train
+    if current_count - last_trained_db_count >= 100 and current_count >= 100:
+        with bg_training_lock:
+            if is_bg_training:
+                return
+            is_bg_training = True
+        
+        logger.info(f"Automated background training triggered: {current_count - last_trained_db_count} new rounds collected.")
+        last_trained_db_count = current_count
+        threading.Thread(target=run_bg_training_job, daemon=True).start()
 
 
 def _ai_process_round(multiplier: float):
@@ -1014,6 +1151,9 @@ def _ai_process_round(multiplier: float):
         # Push updated stats
         socketio.emit('ai_status_update', ai_engine.stats.to_dict())
 
+        # Check for automated background self-training
+        _check_automated_training()
+
     except Exception as e:
         logger.error(f"AI process round error: {e}")
         import traceback
@@ -1029,6 +1169,8 @@ def ai_status():
         'is_running': ai_engine.stats.is_running,
         'session': ai_engine.stats.to_dict(),
         'config': ai_engine.config.to_dict(),
+        'is_training': is_bg_training,
+        'last_training_result': last_training_result,
     })
 
 
@@ -1112,6 +1254,14 @@ def ai_start():
 
     ai_engine.start_session(config)
     bet_executor.dry_run = config.dry_run
+
+    # Reset last trained DB count baseline
+    global last_trained_db_count
+    try:
+        last_trained_db_count = RoadWorxRound.query.count()
+    except Exception as e:
+        logger.warning(f"Could not initialize last_trained_db_count: {e}")
+        last_trained_db_count = 0
 
     # Share the collector's page with the executor
     if collector.page:
@@ -1298,6 +1448,15 @@ def ai_train():
         # Update active config dynamically
         ai_engine.config = opt_config
         socketio.emit('ai_status_update', ai_engine.stats.to_dict())
+
+        global last_training_result
+        last_training_result = {
+            'data_points': len(multipliers),
+            'original_stats': result["original_stats"],
+            'optimized_stats': result["optimized_stats"],
+            'improvement_pct': result["improvement_pct"],
+            'optimized_config': opt_params
+        }
 
         return jsonify({
             'status': 'success',
